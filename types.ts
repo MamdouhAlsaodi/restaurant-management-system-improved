@@ -18,6 +18,8 @@ export interface OrderItem extends MenuItem {
 
 export interface Order {
   id: number;
+  /** Present when a local row mirrors a server (SQLite) paid order — used to prevent double counting. */
+  serverOrderId?: string;
   items: OrderItem[];
   total: number;
   paymentMethod: string;

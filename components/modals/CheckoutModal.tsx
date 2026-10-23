@@ -4,23 +4,90 @@ import { translations } from '../../utils/translations';
 import { Language } from '../../types';
 
 interface CheckoutModalProps {
-  onComplete: (paymentMethod: string, orderSource: string, orderType: string, notes: string, needsDelivery: boolean) => void;
+  onComplete?: (paymentMethod: string, orderSource: string, orderType: string, notes: string, needsDelivery: boolean) => void;
   onCancel: () => void;
   language: Language;
+  /** Server (SQLite) order checkout mode: single order, contract payment methods. */
+  serverOrder?: { id: string; label: string; total: number } | null;
+  onCompleteServer?: (paymentMethod: string) => void;
 }
 
-const CheckoutModal: React.FC<CheckoutModalProps> = ({ onComplete, onCancel, language }) => {
+const CheckoutModal: React.FC<CheckoutModalProps> = ({ onComplete, onCancel, language, serverOrder, onCompleteServer }) => {
   const [paymentMethod, setPaymentMethod] = useState('cash');
   const [orderSource, setOrderSource] = useState('salon');
   const [orderType, setOrderType] = useState('dine_in');
   const [needsDelivery, setNeedsDelivery] = useState(false);
   const [notes, setNotes] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [serverError, setServerError] = useState('');
 
   const t = translations[language];
 
   const handleComplete = () => {
-    onComplete(paymentMethod, orderSource, orderType, notes, needsDelivery);
+    onComplete?.(paymentMethod, orderSource, orderType, notes, needsDelivery);
   };
+
+  const handleCompleteServer = async () => {
+    if (!onCompleteServer || submitting) return;
+    setSubmitting(true);
+    setServerError('');
+    try {
+      await onCompleteServer(paymentMethod);
+    } catch (err: any) {
+      // Errors stay visible — never a silent failure or fake success.
+      setServerError(err?.message ?? 'تعذر تحصيل الطلب');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (serverOrder && onCompleteServer) {
+    const cents = serverOrder.total;
+    const brl = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(cents / 100).replace(/\u00A0/g, ' ');
+    return (
+      <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto" onClick={onCancel}>
+        <div className="bg-white rounded-2xl p-6 max-w-md w-full shadow-2xl animate-in fade-in zoom-in duration-200" onClick={(e) => e.stopPropagation()} dir="rtl">
+          <div className="flex justify-between items-center mb-4 pb-4 border-b">
+            <h2 className="text-xl font-bold text-gray-800 flex items-center gap-2">
+              <CreditCard className="text-green-600" /> تحصيل طلب
+            </h2>
+            <button onClick={onCancel} className="text-gray-400 hover:text-gray-600 bg-gray-100 p-2 rounded-full transition-colors">
+              <X size={20} />
+            </button>
+          </div>
+          <div className="mb-4">
+            <div className="font-bold text-gray-800">{serverOrder.label}</div>
+            <div className="text-2xl font-extrabold text-green-600 mt-1">{brl}</div>
+            <div className="text-xs text-gray-500 mt-1">طلب مستقل: يُحصّل هذا الطلب وحده، بدون دمج مع طلبات أخرى.</div>
+          </div>
+          <label className="block text-sm font-bold mb-2 text-gray-700">طريقة الدفع</label>
+          <select
+            value={paymentMethod}
+            onChange={(e) => setPaymentMethod(e.target.value)}
+            className="w-full p-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-green-500 outline-none bg-white mb-4"
+          >
+            <option value="cash">💵 نقداً (Dinheiro)</option>
+            <option value="pix">📱 Pix</option>
+            <option value="cartao">💳 بطاقة (Cartão)</option>
+            <option value="ifood_card">🍔 iFood Card</option>
+          </select>
+          {serverError && <p className="text-red-600 text-sm font-bold mb-3">⚠️ {serverError}</p>}
+          <div className="flex gap-3 pt-4 border-t">
+            <button onClick={onCancel} className="flex-1 bg-gray-100 text-gray-700 px-4 py-3.5 rounded-xl font-bold hover:bg-gray-200 transition-colors">
+              إلغاء
+            </button>
+            <button
+              onClick={handleCompleteServer}
+              disabled={submitting}
+              className="flex-[2] bg-green-600 text-white px-4 py-3.5 rounded-xl font-bold hover:bg-green-700 transition-all shadow-lg shadow-green-200 flex items-center justify-center gap-2 active:scale-[0.98] disabled:opacity-50"
+            >
+              <Check size={20} /> {submitting ? 'جارٍ التحصيل…' : 'تأكيد التحصيل'}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto" onClick={onCancel}>

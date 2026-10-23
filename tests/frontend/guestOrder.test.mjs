@@ -5,6 +5,7 @@ import { submitGuestOrder } from '../../utils/qr/guestOrder.ts';
 
 const base = {
   token: 'tok-1',
+  guestName: 'أحمد',
   items: [{ id: '5', quantity: 2 }],
   notes: 'بدون بصل',
   requestId: '11111111-2222-3333-4444-555555555555',

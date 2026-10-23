@@ -49,10 +49,27 @@ HttpOnly, SameSite=Strict cookie; `GET /api/admin/session` reports auth state;
 - `GET/PUT /api/admin/menu` — `PUT {items:[{id,name,price,image?,category?,description?}]}` **explicitly publishes a menu snapshot**; `price` is an integer amount in cents
 - `GET /api/admin/orders` (newest first), `POST /api/admin/orders/:id/accept`, `POST /api/admin/orders/:id/reject` (`pending → accepted|rejected` only; otherwise `409`)
 
+Cashier multi-order endpoints (admin session required):
+
+- `POST /api/admin/orders {requestId UUID, guestName nonempty <=80, tableId?}` → `{order}` (`201` new / `200` replay of the same `requestId`): creates an empty **accepted** manual order, `source: 'cashier'`, table label or «كاشير»
+- `POST /api/admin/orders/:id/items {requestId UUID, items:[{id,quantity}]}` → `{order}`: adds **published** menu items to an accepted/unpaid order only; the server resolves names/prices from the snapshot; the same `requestId` is reused across UI retries so an ambiguous failure can never duplicate additions
+- `POST /api/admin/orders/:id/checkout {paymentMethod:'cash'|'pix'|'cartao'|'ifood_card'}` → `{order}`: atomically marks the order `paid`; idempotent for repeated identical payments; rejects empty/pending/rejected orders or a conflicting method
+
+### Cashier UX (multi-order queue)
+
+- The **Orders** tab and the **QR** tab share one order-card queue (single 5s poll in `App.tsx`, component `components/qr/OrderInbox.tsx`).
+- Every open order is a card: pending cards expose قبول/رفض; clicking a card reveals its items, guest name, table, time, source (`ضيف QR`/`كاشير`) and actions.
+- Cashier can create an independent manual order (optional table, name defaults to «كاشير») and add items **from the published menu only** — the server prices them, never the client.
+- Each order is checked out (paid) separately — no automatic combining. Paid/rejected orders are read-only and cannot be modified or re-charged.
+- Ambiguous guest submissions keep the exact frozen request in tab-scoped `sessionStorage`, so reloading the tab replays the same identifier and item snapshot; cashier writes likewise retain a retry identifier in `sessionStorage`. Confirmed/rejected attempts clear those entries.
+- In the Menu tab, when an accepted server order is selected, item adds are routed to that order (banner shown); a selected pending/paid order cannot fall back into the local cart. With no server order selected, the old local cart remains available through its separate labeled button when it has items. The primary cart button opens the order queue.
+- Additions from the Menu tab require the item ID to exist in the published snapshot. The order card lists the actual published items; publish the local menu first if the list is empty.
+- Server **paid** orders appear read-only in Sales/History reporting merged with legacy local sales (deduped by `serverOrderId`); they are never written back into `restaurant-orders` localStorage and never double counted. Pending/accepted/rejected server orders are never sales.
+
 Guest (no session; token-scoped only):
 
 - `GET /api/guest/:token/menu`
-- `POST /api/guest/:token/orders {items:[{id,quantity}],notes?,requestId}` → `201` (or `200` with the same order on idempotent retry with the same `requestId`, which must be a UUID). Item names/prices and the total (integer cents) are always computed server-side from the published snapshot.
+- `POST /api/guest/:token/orders {guestName,items:[{id,quantity}],notes?,requestId}` → `201` (or `200` with the same order on idempotent retry with the same `requestId`, which must be a UUID). `guestName` is a nonempty label (up to 80 characters), not an account. Item names/prices and the total (integer cents) are always computed server-side from the published snapshot.
 
 All state-mutating endpoints require `Content-Type: application/json` and a
 same-origin `Origin` header (no CORS). Login failures get a fixed delay and are
@@ -84,7 +101,7 @@ process; static hosts cannot run it.
 
 ## Backups
 
-All **QR table/menu/order** state lives in the SQLite file (plus `-wal`/`-shm` WAL
+All **new QR/manual table/menu/order/payment** state lives in the SQLite file (plus `-wal`/`-shm` WAL
 sidecars). Pre-existing POS data and checkout/sales remain in the same admin
 browser's `localStorage`; another browser/device will not inherit them. To back
 up: stop the server (or use `sqlite3 db '.backup ...'` / copy all three files

@@ -9,7 +9,7 @@ async function submitOrder(s, table) {
   const res = await fetch(`${s.base}/api/guest/${table.token}/orders`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Origin: s.base },
-    body: JSON.stringify({ items: [{ id: 'pizza', quantity: 1 }], requestId: randomUUID() }),
+    body: JSON.stringify({ items: [{ id: 'pizza', quantity: 1 }], guestName: 'Guest', requestId: randomUUID() }),
   });
   assert.equal(res.status, 201);
   return (await res.json()).order;
@@ -69,7 +69,7 @@ test('orders are listed newest first', async () => {
     const { orders } = await (await s.adminFetch('/api/admin/orders')).json();
     assert.deepEqual(orders.map((o) => o.id), [b.id, a.id]);
     assert.deepEqual(Object.keys(orders[0]).sort(), [
-      'createdAt', 'id', 'items', 'notes', 'status', 'tableLabel', 'total',
+      'createdAt', 'guestName', 'id', 'items', 'notes', 'source', 'status', 'tableId', 'tableLabel', 'total',
     ]);
   } finally {
     await s.stop();
@@ -160,7 +160,7 @@ test('mutations require same-origin JSON content type', async () => {
     res = await fetch(`${s.base}/api/guest/${table.token}/orders`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Origin: 'http://evil.example' },
-      body: JSON.stringify({ items: [{ id: 'pizza', quantity: 1 }], requestId: randomUUID() }),
+      body: JSON.stringify({ items: [{ id: 'pizza', quantity: 1 }], guestName: 'Guest', requestId: randomUUID() }),
     });
     assert.equal(res.status, 403);
   } finally {

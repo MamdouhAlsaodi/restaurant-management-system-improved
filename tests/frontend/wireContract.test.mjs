@@ -85,6 +85,7 @@ test('guest cart ids are strings on submission payload', async () => {
   };
   const order = await submitGuestOrder({
     token: 'tok',
+    guestName: 'أحمد',
     items: [{ id: '12', quantity: 3 }],
     requestId: '11111111-2222-3333-4444-555555555555',
     fetchImpl,
@@ -106,6 +107,7 @@ test('after ambiguous network failure, retry reuses the EXACT same payload snaps
   };
   const snapshot = {
     token: 'tok',
+    guestName: 'أحمد',
     items: [
       { id: '1', quantity: 2 },
       { id: '3', quantity: 1 },
@@ -129,6 +131,7 @@ test('definitive server 4xx raises a NON-ambiguous error (attempt may be release
   await assert.rejects(
     submitGuestOrder({
       token: 'tok',
+      guestName: 'أحمد',
       items: [{ id: '1', quantity: 1 }],
       requestId: 'r-1',
       fetchImpl,
@@ -144,6 +147,7 @@ test('lost response after all retries raises an AMBIGUOUS error', async () => {
   await assert.rejects(
     submitGuestOrder({
       token: 'tok',
+      guestName: 'أحمد',
       items: [{ id: '1', quantity: 1 }],
       requestId: 'r-1',
       fetchImpl,

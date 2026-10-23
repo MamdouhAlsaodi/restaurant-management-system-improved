@@ -2,6 +2,19 @@
 import React, { useState, useEffect } from 'react';
 import { MenuItem, Order, Settings, Discount, DailySalesRecord, OrderItem, Language } from './types';
 import { CATEGORIES, formatDate, getItemPrice, SPECIAL_MENU_CATEGORY } from './utils/helpers';
+import { apiFetch } from './utils/qr/api';
+import {
+  ServerOrder,
+  canAddItems,
+  canApprove,
+  canCheckout,
+  combineForReporting,
+  isPaid,
+  mapServerOrder,
+  retryPersistedWrite,
+} from './utils/qr/adminOrders';
+import { PublishedMenuItem } from './utils/qr/helpers';
+import OrderInbox, { InboxTable } from './components/qr/OrderInbox';
 import { translations } from './utils/translations';
 import MenuView from './components/views/MenuView';
 import SalesView from './components/views/SalesView';
@@ -28,6 +41,16 @@ const App = () => {
   const [showDiscounts, setShowDiscounts] = useState(false);
   const [settings, setSettings] = useState<Settings>({ dailyMotorcycleCost: 30, perDeliveryCost: 10, showLimitedMenu: false, language: 'ar' });
   const [dailySalesRecords, setDailySalesRecords] = useState<Record<string, DailySalesRecord>>({});
+
+  // -- Server multi-order state (SQLite; never written to localStorage) --
+  const [serverOrders, setServerOrders] = useState<ServerOrder[]>([]);
+  const [serverLoadError, setServerLoadError] = useState('');
+  const [serverActionError, setServerActionError] = useState('');
+  const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
+  const [busyServerId, setBusyServerId] = useState<string | null>(null);
+  const [inboxTables, setInboxTables] = useState<InboxTable[]>([]);
+  const [publishedMenu, setPublishedMenu] = useState<PublishedMenuItem[]>([]);
+  const [checkoutServerOrder, setCheckoutServerOrder] = useState<ServerOrder | null>(null);
 
   const language: Language = settings.language || 'ar';
   const t = translations[language];
@@ -60,6 +83,127 @@ const App = () => {
       console.error('Error loading data', error);
     }
   }, []);
+
+  // -- Server order queue (authenticated same-origin cookie session) --
+  const refreshServerOrders = async () => {
+    try {
+      const data = await apiFetch<{ orders: any[] }>('/api/admin/orders');
+      setServerOrders((data.orders ?? []).map(mapServerOrder));
+      setServerLoadError('');
+    } catch (err: any) {
+      setServerLoadError(err?.message ?? 'تعذر تحميل الطلبات');
+    }
+  };
+
+  const refreshInboxMeta = async () => {
+    try {
+      const tablesData = await apiFetch<{ tables: InboxTable[] }>('/api/admin/tables');
+      setInboxTables(tablesData.tables ?? []);
+    } catch { /* table list is optional for manual creation */ }
+    try {
+      const menuData = await apiFetch<{ items: PublishedMenuItem[] }>('/api/admin/menu');
+      setPublishedMenu(menuData.items ?? []);
+    } catch { /* published menu may not exist yet */ }
+  };
+
+  useEffect(() => {
+    refreshServerOrders();
+    refreshInboxMeta();
+    const timer = setInterval(refreshServerOrders, 5000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const selectedServerOrder = serverOrders.find((o) => o.id === selectedServerId) ?? null;
+
+  const mergeServerOrder = (order: ServerOrder) => {
+    setServerOrders((prev) => {
+      const others = prev.filter((o) => o.id !== order.id);
+      return [order, ...others];
+    });
+  };
+
+  const withServerAction = async (order: ServerOrder | null, fn: () => Promise<void>) => {
+    if (busyServerId !== null) return false;
+    setBusyServerId(order?.id ?? '__global__');
+    setServerActionError('');
+    try {
+      await fn();
+      return true;
+    } catch (err: any) {
+      setServerActionError(err?.message ?? 'حدث خطأ غير متوقع');
+      return false;
+    } finally {
+      setBusyServerId(null);
+    }
+  };
+
+  const handleServerDecision = (order: ServerOrder, action: 'accept' | 'reject') =>
+    withServerAction(order, async () => {
+      if (!canApprove(order)) {
+        setServerActionError('لا يمكن مراجعة طلب تمت معالجته مسبقاً');
+        return;
+      }
+      const data = await apiFetch<{ order: any }>(`/api/admin/orders/${order.id}/${action}`, { method: 'POST' });
+      mergeServerOrder(mapServerOrder(data.order));
+    });
+
+  const handleCreateManualOrder = (guestName: string, tableId: number | null) =>
+    withServerAction(selectedServerOrder, async () => {
+      // Stable requestId across retries: an ambiguous failure replays the same
+      // request and the server answers 200 replay instead of duplicating.
+      const data = await retryPersistedWrite(`create:${JSON.stringify([guestName, tableId])}`, async (requestId) => {
+        const reply = await apiFetch<{ order: any }>('/api/admin/orders', {
+          method: 'POST',
+          body: { requestId, guestName, tableId: tableId ?? undefined },
+        });
+        if (!reply?.order?.id) throw new Error('رد غير مكتمل من الخادم؛ أعد المحاولة');
+        return reply;
+      });
+      mergeServerOrder(mapServerOrder(data.order));
+      setSelectedServerId(data.order.id);
+    });
+
+  const handleAddServerItems = (orderId: string, publishedItemId: string, quantity: number) => {
+    const order = serverOrders.find((o) => o.id === orderId);
+    if (!order || !canAddItems(order)) {
+      setServerActionError('يمكن إضافة الأصناف إلى الطلبات المقبولة غير المدفوعة فقط');
+      return false;
+    }
+    return withServerAction(order, async () => {
+      const data = await retryPersistedWrite(`add:${JSON.stringify([orderId, publishedItemId, quantity])}`, async (requestId) => {
+        const reply = await apiFetch<{ order: any }>(`/api/admin/orders/${orderId}/items`, {
+          method: 'POST',
+          body: { requestId, items: [{ id: publishedItemId, quantity }] },
+        });
+        if (!reply?.order?.id) throw new Error('رد غير مكتمل من الخادم؛ أعد المحاولة');
+        return reply;
+      });
+      mergeServerOrder(mapServerOrder(data.order));
+    });
+  };
+
+  const handleCheckoutServerOrder = async (order: ServerOrder, paymentMethod: string) => {
+    if (busyServerId !== null) throw new Error('هناك عملية أخرى قيد التنفيذ');
+    if (!canCheckout(order)) {
+      setCheckoutServerOrder(null);
+      throw new Error('لا يمكن تحصيل طلب غير مقبول أو مدفوع مسبقاً');
+    }
+    setBusyServerId(order.id);
+    setServerActionError('');
+    try {
+      const data = await apiFetch<{ order: any }>(`/api/admin/orders/${order.id}/checkout`, {
+        method: 'POST',
+        body: { paymentMethod },
+      });
+      mergeServerOrder(mapServerOrder(data.order));
+      setCheckoutServerOrder(null);
+    } catch (err: any) {
+      setServerActionError(err?.message ?? 'تعذر تحصيل الطلب');
+      throw err;
+    } finally {
+      setBusyServerId(null);
+    }
+  };
 
   const saveData = (key: string, data: any) => {
     localStorage.setItem(key, JSON.stringify(data));
@@ -187,6 +331,31 @@ const App = () => {
 
   const totalItemsInCart = currentOrder.reduce((acc, item) => acc + item.quantity, 0);
 
+  // Reporting = legacy local sales + read-only server PAID orders, deduped.
+  // Pending/accepted/rejected server orders are never sales. Server paid
+  // orders are never written back into restaurant-orders localStorage.
+  const unifiedReportingOrders = React.useMemo(
+    () => combineForReporting(completedOrders, serverOrders),
+    [completedOrders, serverOrders],
+  );
+  const paidServerCount = serverOrders.filter(isPaid).length;
+
+  const inboxProps = {
+    orders: serverOrders,
+    tables: inboxTables,
+    publishedMenu,
+    loadError: serverLoadError,
+    actionError: serverActionError,
+    busyOrderId: busyServerId,
+    selectedId: selectedServerId,
+    onSelect: setSelectedServerId,
+    onApprove: (o: ServerOrder) => handleServerDecision(o, 'accept'),
+    onReject: (o: ServerOrder) => handleServerDecision(o, 'reject'),
+    onCreateManual: handleCreateManualOrder,
+    onAddItems: handleAddServerItems,
+    onCheckout: (o: ServerOrder) => setCheckoutServerOrder(o),
+  };
+
   return (
     <div className={`min-h-screen bg-gray-50 text-gray-800 font-sans`}>
       {/* Header */}
@@ -206,15 +375,20 @@ const App = () => {
             <button onClick={() => setShowSettings(true)} className="p-2.5 rounded-xl bg-gray-100 text-gray-600 hover:bg-gray-200 transition-colors">
               <SettingsIcon size={20} />
             </button>
+            {totalItemsInCart > 0 && !selectedServerOrder && (
+              <button onClick={() => setShowCart(true)} className="rounded-xl bg-gray-100 px-3 py-2 text-sm text-gray-700">
+                سلة محلية ({totalItemsInCart})
+              </button>
+            )}
             <button
-                onClick={() => setShowCart(true)}
+                onClick={() => setView('orders')}
                 className="relative bg-gray-900 text-white px-5 py-2.5 rounded-xl font-bold hover:bg-gray-800 transition-all flex items-center gap-2 shadow-xl shadow-gray-200 active:scale-95"
-            >
-              <ShoppingCart size={20} />
-              <span className="hidden sm:inline">{t.cart}</span>
-              {totalItemsInCart > 0 && (
+                >
+                <ShoppingCart size={20} />
+                <span className="hidden sm:inline">الطلبات</span>
+                {serverOrders.filter(o => o.status === 'pending' || o.status === 'accepted').length > 0 && (
                 <span className="absolute -top-2 -right-2 bg-red-500 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs border-2 border-white animate-pulse">
-                  {totalItemsInCart}
+                  {serverOrders.filter(o => o.status === 'pending' || o.status === 'accepted').length}
                 </span>
               )}
             </button>
@@ -247,6 +421,10 @@ const App = () => {
             discounts={discounts}
             showLimitedMenu={settings.showLimitedMenu}
             language={language}
+            serverTarget={selectedServerOrder}
+            onAddToServerOrder={(publishedId, qty) => {
+              if (selectedServerOrder) handleAddServerItems(selectedServerOrder.id, publishedId, qty);
+            }}
             onUpdateOrder={handleUpdateOrder}
             onEditItem={(item) => {
                 const newItems = menuItems.map(i => i.id === item.id ? item : i);
@@ -276,7 +454,7 @@ const App = () => {
           <SalesView
             analytics={
                 (() => {
-                    const dateOrders = completedOrders.filter(o => o.dateOnly === selectedSalesDate && o.status !== 'cancelled');
+                    const dateOrders = unifiedReportingOrders.filter(o => o.dateOnly === selectedSalesDate && o.status !== 'cancelled');
                     const totalSales = dateOrders.reduce((s, o) => s + o.total, 0);
                     const paymentBreakdown: any = { cash: 0, pix: 0, ifood_card: 0, cartao: 0 };
                     dateOrders.forEach(o => paymentBreakdown[o.paymentMethod] = (paymentBreakdown[o.paymentMethod] || 0) + o.total);
@@ -308,7 +486,7 @@ const App = () => {
                         ordersCount: dateOrders.length,
                         sourceBreakdown,
                         typeBreakdown,
-                        cancelledCount: completedOrders.filter(o => o.dateOnly === selectedSalesDate && o.status === 'cancelled').length
+                        cancelledCount: unifiedReportingOrders.filter(o => o.dateOnly === selectedSalesDate && o.status === 'cancelled').length
                     };
                 })()
             }
@@ -319,7 +497,7 @@ const App = () => {
             }}
             selectedDate={selectedSalesDate}
             onDateChange={setSelectedSalesDate}
-            availableDates={([...new Set(completedOrders.map(o => o.dateOnly))] as string[]).sort((a,b) => {
+            availableDates={([...new Set(unifiedReportingOrders.map(o => o.dateOnly))] as string[]).sort((a,b) => {
                  const [da, ma, ya] = a.split('/').map(Number);
                  const [db, mb, yb] = b.split('/').map(Number);
                  return new Date(yb, mb-1, db).getTime() - new Date(ya, ma-1, da).getTime();
@@ -328,7 +506,11 @@ const App = () => {
         )}
 
         {view === 'orders' && (
-          <OrdersView
+          <>
+            {/* Primary multi-order queue: order cards, approve/reject, per-order checkout */}
+            <OrderInbox {...inboxProps} />
+            <h2 style={{ margin: '32px 0 8px', fontSize: 18, color: '#374151' }}>المبيعات المحلية القديمة (Legacy)</h2>
+            <OrdersView
             orders={completedOrders}
             language={language}
             onToggleStatus={(id) => {
@@ -350,6 +532,7 @@ const App = () => {
                 handleUpdateOrders(updated);
             }}
           />
+          </>
         )}
 
         {view === 'history' && (
@@ -357,9 +540,9 @@ const App = () => {
             language={language}
             records={(() => {
                 const recs: Record<string, DailySalesRecord> = {};
-                const dates = [...new Set(completedOrders.map(o => o.dateOnly))] as string[];
+                const dates = [...new Set(unifiedReportingOrders.map(o => o.dateOnly))] as string[];
                 dates.forEach(d => {
-                    const dateOrders = completedOrders.filter(o => o.dateOnly === d && o.status !== 'cancelled');
+                    const dateOrders = unifiedReportingOrders.filter(o => o.dateOnly === d && o.status !== 'cancelled');
                     const totalSales = dateOrders.reduce((s, o) => s + o.total, 0);
                     const deliveryCount = dateOrders.filter(o => o.needsDelivery).length;
                     const deliveryCost = settings.dailyMotorcycleCost + (deliveryCount * settings.perDeliveryCost);
@@ -383,10 +566,9 @@ const App = () => {
           />
         )}
 
-        {/* QR table orders: pending guest orders are never counted as paid and
-            never inserted into local sales. Checkout/payment integration is
-            future work. */}
-        {view === 'qr' && <QRPanel menuItems={menuItems} />}
+        {/* QR tables + the same authenticated order queue. Pending guest orders
+            are never counted as paid and never inserted into local sales. */}
+        {view === 'qr' && <QRPanel menuItems={menuItems} inbox={inboxProps} paidServerCount={paidServerCount} onMetaChange={refreshInboxMeta} />}
       </main>
 
       {/* Modals */}
@@ -402,7 +584,15 @@ const App = () => {
           onCheckout={() => { setShowCart(false); setShowCheckout(true); }}
         />
       )}
-      {showCheckout && <CheckoutModal language={language} onCancel={() => setShowCheckout(false)} onComplete={handleCheckout} />}
+      {checkoutServerOrder && (
+        <CheckoutModal
+          language={language}
+          serverOrder={{ id: checkoutServerOrder.id, label: `${checkoutServerOrder.guestName} — ${checkoutServerOrder.tableLabel}`, total: checkoutServerOrder.total }}
+          onCancel={() => setCheckoutServerOrder(null)}
+          onCompleteServer={(method) => handleCheckoutServerOrder(checkoutServerOrder, method)}
+        />
+      )}
+      {showCheckout && !checkoutServerOrder && <CheckoutModal language={language} onCancel={() => setShowCheckout(false)} onComplete={handleCheckout} />}
       {showSettings && <SettingsModal settings={settings} onSave={handleUpdateSettings} onClose={() => setShowSettings(false)} onExport={handleExport} onImport={handleImport} />}
       {showDiscounts && <DiscountsModal language={language} items={menuItems} discounts={discounts} onSave={handleUpdateDiscounts} onClose={() => setShowDiscounts(false)} />}
     </div>

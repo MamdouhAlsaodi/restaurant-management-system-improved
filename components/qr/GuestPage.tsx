@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { apiFetch } from '../../utils/qr/api';
 import { formatBRL, guestCartTotal } from '../../utils/qr/helpers';
 import { GuestOrderSubmitError, submitGuestOrder } from '../../utils/qr/guestOrder';
+import { clearPendingGuestAttempt, loadPendingGuestAttempt, savePendingGuestAttempt, PendingGuestAttempt } from '../../utils/qr/guestAttempt';
 
 interface GuestMenuItem {
   /** Backend menu ids are strings. */
@@ -28,12 +29,19 @@ interface GuestOrder {
 const GuestPage = ({ token }: { token: string }) => {
   const [tableLabel, setTableLabel] = useState('');
   const [items, setItems] = useState<GuestMenuItem[]>([]);
-  const [cart, setCart] = useState<Record<string, number>>({});
-  const [notes, setNotes] = useState('');
-  const [requestId, setRequestId] = useState<string | null>(null);
+  const [restored] = useState(() => loadPendingGuestAttempt(token));
+  const [pendingAttempt, setPendingAttempt] = useState<PendingGuestAttempt | null>(restored);
+  const [cart, setCart] = useState<Record<string, number>>(() =>
+    Object.fromEntries(restored?.items.map((i) => [i.id, i.quantity]) ?? []));
+  // Guest name is required per submission (not account login). Kept after a
+  // successful order so the same guest can place another distinct order.
+  const [guestName, setGuestName] = useState(restored?.guestName ?? '');
+  const [nameTouched, setNameTouched] = useState(false);
+  const [notes, setNotes] = useState(restored?.notes ?? '');
+  const [requestId, setRequestId] = useState<string | null>(restored?.requestId ?? null);
   // True while an ambiguous submission is outstanding: cart and notes are
   // frozen because the same requestId MUST NOT be reused with an edited payload.
-  const [frozen, setFrozen] = useState(false);
+  const [frozen, setFrozen] = useState(!!restored);
   const [submitting, setSubmitting] = useState(false);
   const [submittedOrder, setSubmittedOrder] = useState<GuestOrder | null>(null);
   const [error, setError] = useState('');
@@ -87,37 +95,58 @@ const GuestPage = ({ token }: { token: string }) => {
     });
   };
 
+  const trimmedName = guestName.trim();
+  const nameInvalid = trimmedName.length === 0 || trimmedName.length > 80;
+  const showNameError = nameTouched && nameInvalid;
+
+  const startNewOrder = () => {
+    // Allow another distinct order (new requestId) after success; the guest
+    // name is prefilled but still editable and re-required on submit.
+    setSubmittedOrder(null);
+    setCart({});
+    setNotes('');
+    setRequestId(null);
+    setPendingAttempt(null);
+    clearPendingGuestAttempt(token);
+    setFrozen(false);
+    setSubmitError('');
+  };
+
   const handleSubmit = async () => {
-    if (submitting || frozen || cartLines.length === 0 || submittedOrder) return;
+    if (submitting || (!frozen && cartLines.length === 0) || submittedOrder) return;
+    setNameTouched(true);
+    if (nameInvalid) return;
     setSubmitError('');
     setSubmitting(true);
-    // One requestId per attempted order; reused verbatim on retries so the
-    // backend can deduplicate if a response was lost.
-    const rid = requestId ?? crypto.randomUUID();
+    // Persist the exact payload BEFORE sending, so even a reload after a lost
+    // response can only replay the same request (never silently create another).
+    const attempt: PendingGuestAttempt = pendingAttempt ?? {
+      requestId: requestId ?? crypto.randomUUID(),
+      guestName: trimmedName,
+      items: cartLines.map((l) => ({ id: String(l.id), quantity: l.quantity })),
+      notes: notes.trim(),
+    };
+    savePendingGuestAttempt(token, attempt);
+    setPendingAttempt(attempt);
     try {
-      const order = await submitGuestOrder({
-        token,
-        items: cartLines.map((l) => ({ id: String(l.id), quantity: l.quantity })),
-        notes: notes.trim() || undefined,
-        requestId: rid,
-      });
+      const order = await submitGuestOrder({ token, ...attempt });
+      clearPendingGuestAttempt(token);
+      setPendingAttempt(null);
       setSubmittedOrder(order);
       setCart({});
       setNotes('');
-      setRequestId(null); // clear on success; next order gets a fresh id
+      setRequestId(null); // next order gets a fresh id
       setFrozen(false);
     } catch (err: any) {
       if (err instanceof GuestOrderSubmitError && err.ambiguous) {
-        // Response lost: a previous submission MAY have arrived. Freeze the
-        // exact cart/notes snapshot and keep the same requestId for retry.
-        setRequestId(rid);
+        setRequestId(attempt.requestId);
         setFrozen(true);
         setSubmitError(
           'تعذر تأكيد استلام الطلب: قد يكون طلبك السابق قد وصل بالفعل. تم تثبيت الأصناف والملاحظات ولا يمكن تعديلها الآن؛ أعد المحاولة لإرسال نفس الطلب بنفس المرجع.',
         );
       } else {
-        // Definitive server rejection: the order was NOT created, so release
-        // the attempt and let the customer edit before retrying.
+        clearPendingGuestAttempt(token);
+        setPendingAttempt(null);
         setRequestId(null);
         setFrozen(false);
         setSubmitError(`${err?.message ?? 'تعذر إرسال الطلب'} — يمكنك تعديل طلبك والمحاولة مجدداً.`);
@@ -157,6 +186,9 @@ const GuestPage = ({ token }: { token: string }) => {
           <p>رقم الطلب: {submittedOrder.id}</p>
           <p>الحالة: بانتظار الموافقة</p>
           <p style={styles.muted}>سيتم تأكيد الطلب من إدارة المطعم.</p>
+          <button style={styles.newOrderBtn} onClick={startNewOrder}>
+            إرسال طلب آخر
+          </button>
         </div>
       </div>
     );
@@ -202,9 +234,35 @@ const GuestPage = ({ token }: { token: string }) => {
       ))}
 
       <div style={styles.card}>
+        <label style={styles.nameLabel} htmlFor="guest-name">الاسم</label>
+        <input
+          id="guest-name"
+          style={{ ...styles.nameInput, ...(showNameError ? styles.nameInputError : {}) }}
+          placeholder="الاسم (مطلوب)"
+          value={guestName}
+          disabled={frozen || submitting}
+          maxLength={80}
+          onChange={(e) => {
+            setGuestName(e.target.value);
+            setNameTouched(true);
+          }}
+        />
+        {showNameError && (
+          <p style={{ ...styles.muted, color: '#b91c1c' }}>
+            {trimmedName.length === 0 ? 'الاسم مطلوب لإرسال الطلب' : 'الاسم يجب أن يكون 80 حرفاً أو أقل'}
+          </p>
+        )}
+        {frozen && (
+          <p style={{ ...styles.muted, color: '#92400e' }}>🔒 الاسم مثبّت مع الطلب حتى يتم التأكد من وصوله.</p>
+        )}
+        {frozen && pendingAttempt && cartLines.length !== pendingAttempt.items.length && (
+          <p style={{ ...styles.muted, color: '#92400e' }}>
+            بعض الأصناف تغيّرت في القائمة؛ ستُعاد المحاولة بالطلب الأصلي: {pendingAttempt.items.map(i => `${i.id} ×${i.quantity}`).join('، ')}.
+          </p>
+        )}
         <div style={styles.totalRow}>
           <span>الإجمالي ({itemCount} صنف)</span>
-          <strong>{formatBRL(total)}</strong>
+          <strong>{frozen && pendingAttempt && cartLines.length !== pendingAttempt.items.length ? 'راجع الطلب عند التأكيد' : formatBRL(total)}</strong>
         </div>
         {frozen && (
           <p style={{ ...styles.muted, color: '#92400e' }}>
@@ -223,9 +281,9 @@ const GuestPage = ({ token }: { token: string }) => {
         <button
           style={{
             ...styles.submitBtn,
-            ...(submitting || frozen || cartLines.length === 0 ? styles.disabled : {}),
+            ...(submitting || (!frozen && cartLines.length === 0) ? styles.disabled : {}),
           }}
-          disabled={submitting || frozen || cartLines.length === 0}
+          disabled={submitting || (!frozen && cartLines.length === 0) || nameInvalid}
           onClick={handleSubmit}
         >
           {submitting ? 'جارٍ الإرسال…' : frozen ? 'أعد المحاولة بنفس المرجع' : 'إرسال الطلب'}
@@ -249,6 +307,10 @@ const styles: Record<string, React.CSSProperties> = {
   qtyValue: { minWidth: 22, textAlign: 'center' },
   totalRow: { display: 'flex', justifyContent: 'space-between', fontSize: 17, marginBottom: 10 },
   notes: { width: '100%', boxSizing: 'border-box', minHeight: 60, marginBottom: 10, padding: 8, borderRadius: 8, border: '1px solid #ccc' },
+  nameLabel: { display: 'block', fontSize: 14, fontWeight: 600, marginBottom: 4 },
+  nameInput: { width: '100%', boxSizing: 'border-box', padding: 10, marginBottom: 6, borderRadius: 8, border: '1px solid #ccc', fontSize: 16 },
+  nameInputError: { borderColor: '#b91c1c' },
+  newOrderBtn: { marginTop: 12, padding: '10px 18px', borderRadius: 8, border: 'none', background: '#059669', color: '#fff', fontWeight: 700 },
   submitBtn: { width: '100%', padding: 12, fontSize: 17, borderRadius: 10, border: 'none', background: '#059669', color: '#fff', fontWeight: 700 },
   disabled: { opacity: 0.5 },
   errorBox: { borderColor: '#b91c1c', color: '#b91c1c', textAlign: 'center' },

@@ -203,17 +203,51 @@ export function createApp({
 
   function orderPayload(orderRow) {
     const items = db
-      .prepare('SELECT item_id AS id, name, price_cents AS price, quantity FROM order_items WHERE order_id = ?')
+      .prepare('SELECT item_id AS id, name, price_cents AS price, quantity, source FROM order_items WHERE order_id = ?')
       .all(orderRow.id);
     return {
       id: orderRow.id,
+      tableId: orderRow.table_id === null ? null : Number(orderRow.table_id),
       tableLabel: orderRow.table_label,
+      guestName: orderRow.guest_name ?? orderRow.table_label, // legacy rows fall back to table label
+      source: orderRow.source ?? 'guest',
       items,
       total: orderRow.total_cents,
       notes: orderRow.notes ?? '',
       status: orderRow.status,
       createdAt: orderRow.created_at,
+      ...(orderRow.status === 'paid'
+        ? { paidAt: orderRow.paid_at ?? null, paymentMethod: orderRow.payment_method ?? null }
+        : {}),
     };
+  }
+
+  // Guests never see financial/admin-only payment details.
+  function guestOrderPayload(order) {
+    const { paidAt, paymentMethod, ...rest } = order;
+    return rest;
+  }
+
+  const PAYMENT_METHODS = new Set(['cash', 'pix', 'cartao', 'ifood_card']);
+
+  function validateItemsRequest(body) {
+    if (typeof body.requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.requestId)) {
+      return { error: 'requestId must be a UUID' };
+    }
+    if (!Array.isArray(body.items) || body.items.length === 0 || body.items.length > 50) {
+      return { error: 'items must be a non-empty array' };
+    }
+    const seen = new Set();
+    for (const it of body.items) {
+      if (typeof it !== 'object' || it === null) return { error: 'invalid item' };
+      if (!isNonEmptyString(it.id, 64)) return { error: 'invalid item id' };
+      if (!Number.isInteger(it.quantity) || it.quantity < 1 || it.quantity > 99) {
+        return { error: 'invalid quantity' };
+      }
+      if (seen.has(it.id)) return { error: 'duplicate item' };
+      seen.add(it.id);
+    }
+    return { wanted: body.items };
   }
 
   function menuItems() {
@@ -263,15 +297,29 @@ export function createApp({
     return out;
   }
 
-  const insertOrderTx = function (order, items) {
-      withTransaction(() => {
-        db.prepare(
-          'INSERT INTO orders (id, table_id, table_label, notes, total_cents, status, created_at, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-        ).run(order.id, order.table_id, order.table_label, order.notes, order.total_cents, 'pending', order.created_at, order.request_id);
-        const ins = db.prepare('INSERT INTO order_items (order_id, item_id, name, price_cents, quantity) VALUES (?, ?, ?, ?, ?)');
-        for (const it of items) ins.run(order.id, it.id, it.name, it.price, it.quantity);
-      });
-  };
+  function insertOrderTx(order, items) {
+    withTransaction(() => {
+      db.prepare(
+        'INSERT INTO orders (id, table_id, table_label, guest_name, source, notes, total_cents, status, created_at, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run(
+        order.id,
+        order.table_id,
+        order.table_label,
+        order.guest_name,
+        order.source ?? 'guest',
+        order.notes,
+        order.total_cents,
+        order.status ?? 'pending',
+        order.created_at,
+        order.request_id
+      );
+      const ins = db.prepare(
+        'INSERT INTO order_items (order_id, item_id, name, price_cents, quantity, source) VALUES (?, ?, ?, ?, ?, ?)'
+      );
+      for (const it of items)
+        ins.run(order.id, it.id, it.name, it.price, it.quantity, it.source ?? 'guest');
+    });
+  }
 
   function validateOrderPayload(body) {
     if (!Array.isArray(body.items) || body.items.length === 0 || body.items.length > 50) {
@@ -295,7 +343,10 @@ export function createApp({
     if (typeof body.requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.requestId)) {
       return { error: 'requestId must be a UUID' };
     }
-    return { wanted, notes: typeof body.notes === 'string' ? body.notes : '' };
+    if (!isNonEmptyString(body.guestName, 80)) {
+      return { error: 'guestName is required (1-80 chars)' };
+    }
+    return { wanted, notes: typeof body.notes === 'string' ? body.notes : '', guestName: body.guestName.trim() };
   }
 
   // ---- API routing ----
@@ -368,7 +419,7 @@ export function createApp({
       const existing = db
         .prepare('SELECT * FROM orders WHERE table_id = ? AND request_id = ?')
         .get(table.id, body.requestId);
-      if (existing) return json(res, 200, { order: orderPayload(existing) });
+      if (existing) return json(res, 200, { order: guestOrderPayload(orderPayload(existing)) });
       if (guestRateLimited(ip, table.token)) {
         res.setHeader('Retry-After', String(GUEST_WINDOW_MS / 1000));
         return errorJson(res, 429, 'Too many submissions');
@@ -388,13 +439,16 @@ export function createApp({
         id: randomUUID(),
         table_id: table.id,
         table_label: table.label,
+        guest_name: v.guestName,
+        source: 'guest',
         notes: v.notes,
         total_cents: total,
         created_at: new Date().toISOString(),
         request_id: body.requestId,
       };
       insertOrderTx(order, priced);
-      return json(res, 201, { order: orderPayload({ ...order, status: 'pending' }) });
+      const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(order.id);
+      return json(res, 201, { order: guestOrderPayload(orderPayload(row)) });
     }
 
     // Everything below: authenticated admin area
@@ -443,6 +497,117 @@ export function createApp({
     if (pathname === '/api/admin/orders' && method === 'GET') {
       const rows = db.prepare('SELECT * FROM orders ORDER BY created_at DESC, rowid DESC').all();
       return json(res, 200, { orders: rows.map(orderPayload) });
+    }
+
+    if (pathname === '/api/admin/orders' && method === 'POST') {
+      const body = await readJson(req, res);
+      if (body === undefined) return;
+      if (typeof body.requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.requestId)) {
+        return errorJson(res, 400, 'requestId must be a UUID');
+      }
+      if (!isNonEmptyString(body.guestName, 80)) {
+        return errorJson(res, 400, 'guestName is required (1-80 chars)');
+      }
+      // Replay before table lookup: a previously-created order must remain
+      // recoverable even if the table was deactivated after a lost response.
+      const existing = db
+        .prepare("SELECT * FROM orders WHERE source = 'cashier' AND request_id = ?")
+        .get(body.requestId);
+      if (existing) return json(res, 200, { order: orderPayload(existing) });
+      let table = null;
+      if (body.tableId !== undefined) {
+        if (!Number.isInteger(body.tableId) || body.tableId < 1) {
+          return errorJson(res, 400, 'tableId must be a known table id');
+        }
+        table = db.prepare('SELECT * FROM restaurant_tables WHERE id = ? AND active = 1').get(body.tableId);
+        if (!table) return errorJson(res, 400, 'tableId must be a known active table id');
+      }
+      const order = {
+        id: randomUUID(),
+        table_id: table ? table.id : null,
+        table_label: table ? table.label : 'كاشير',
+        guest_name: body.guestName.trim(),
+        source: 'cashier',
+        notes: '',
+        total_cents: 0,
+        status: 'accepted',
+        created_at: new Date().toISOString(),
+        request_id: body.requestId,
+      };
+      insertOrderTx(order, []);
+      const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(order.id);
+      return json(res, 201, { order: orderPayload(row) });
+    }
+
+    m = /^\/api\/admin\/orders\/([0-9a-f-]{36})\/items$/.exec(pathname);
+    if (m && method === 'POST') {
+      const body = await readJson(req, res);
+      if (body === undefined) return;
+      const v = validateItemsRequest(body);
+      if (v.error) return errorJson(res, 400, v.error);
+      const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(m[1]);
+      if (!row) return errorJson(res, 404, 'Not found');
+      // Ledger, not merely the last request: a delayed retry can arrive after
+      // other additions or payment and must still be a replay, never a second charge.
+      if (db.prepare('SELECT 1 FROM order_item_requests WHERE order_id = ? AND request_id = ?').get(row.id, body.requestId)) {
+        return json(res, 200, { order: orderPayload(row) });
+      }
+      if (row.status !== 'accepted') {
+        return errorJson(res, 409, `Order is ${row.status}; only accepted unpaid orders can be modified`);
+      }
+      const menuById = new Map(menuItems().map((i) => [i.id, i]));
+      const priced = [];
+      let added = 0;
+      for (const w of v.wanted) {
+        const item = menuById.get(w.id);
+        if (!item) return errorJson(res, 400, 'Unknown menu item');
+        priced.push({ id: item.id, name: item.name, price: item.price, quantity: w.quantity, source: 'cashier' });
+        added += item.price * w.quantity;
+      }
+      withTransaction(() => {
+        db.prepare('INSERT INTO order_item_requests (order_id, request_id) VALUES (?, ?)').run(row.id, body.requestId);
+        const ins = db.prepare(
+          'INSERT INTO order_items (order_id, item_id, name, price_cents, quantity, source) VALUES (?, ?, ?, ?, ?, ?)'
+        );
+        for (const it of priced) ins.run(row.id, it.id, it.name, it.price, it.quantity, it.source);
+        db.prepare('UPDATE orders SET total_cents = total_cents + ?, last_request_id = ? WHERE id = ?').run(
+          added,
+          body.requestId,
+          row.id
+        );
+      });
+      const updated = db.prepare('SELECT * FROM orders WHERE id = ?').get(row.id);
+      return json(res, 200, { order: orderPayload(updated) });
+    }
+
+    m = /^\/api\/admin\/orders\/([0-9a-f-]{36})\/checkout$/.exec(pathname);
+    if (m && method === 'POST') {
+      const body = await readJson(req, res);
+      if (body === undefined) return;
+      if (!PAYMENT_METHODS.has(body.paymentMethod)) {
+        return errorJson(res, 400, 'paymentMethod must be one of cash, pix, cartao, ifood_card');
+      }
+      const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(m[1]);
+      if (!row) return errorJson(res, 404, 'Not found');
+      if (row.status === 'paid') {
+        // Idempotent on repeated matching payment; conflict on a different method.
+        if (row.payment_method === body.paymentMethod) {
+          return json(res, 200, { order: orderPayload(row) });
+        }
+        return errorJson(res, 409, `Order already paid with ${row.payment_method}`);
+      }
+      if (row.status !== 'accepted') {
+        return errorJson(res, 409, `Order is ${row.status}; only accepted orders can be paid`);
+      }
+      const itemCount = db.prepare('SELECT COUNT(*) AS n FROM order_items WHERE order_id = ?').get(row.id).n;
+      if (itemCount === 0) return errorJson(res, 400, 'Cannot pay an empty order');
+      withTransaction(() => {
+        db.prepare(
+          "UPDATE orders SET status = 'paid', paid_at = ?, payment_method = ? WHERE id = ? AND status = 'accepted'"
+        ).run(new Date().toISOString(), body.paymentMethod, row.id);
+      });
+      const paid = db.prepare('SELECT * FROM orders WHERE id = ?').get(row.id);
+      return json(res, 200, { order: orderPayload(paid) });
     }
 
     m = /^\/api\/admin\/orders\/([0-9a-f-]{36})\/(accept|reject)$/.exec(pathname);
