@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS orders (
   request_id TEXT NOT NULL,
   last_request_id TEXT,
   paid_at TEXT,
-  payment_method TEXT CHECK (payment_method IN ('cash','pix','cartao','ifood_card'))
+  payment_method TEXT CHECK (payment_method IN ('cash','pix','cartao','ifood_card')),
+  prep_status TEXT CHECK (prep_status IN ('waiting','preparing','ready','served'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_table_request
   ON orders (table_id, request_id);
@@ -100,6 +101,20 @@ function migrateLegacyOrders(db) {
   }
 }
 
+// Additive migration for the optional kitchen screen: accepted/paid orders
+// gain a persisted preparation state. Existing rows and columns are untouched;
+// NULL prep_status on legacy accepted/paid rows is treated as 'waiting' by the API.
+function migrateOrdersPrepStatus(db) {
+  const ordersInfo = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'orders'").get();
+  if (!ordersInfo) return;
+  const cols = db.prepare('PRAGMA table_info(orders)').all().map((c) => c.name);
+  if (cols.includes('prep_status')) return;
+  db.exec("ALTER TABLE orders ADD COLUMN prep_status TEXT CHECK (prep_status IN ('waiting','preparing','ready','served'))");
+  // Accepted/paid orders already entered the flow; NULL would hide them from
+  // the kitchen screen, so they default to 'waiting'. Nothing else changes.
+  db.exec("UPDATE orders SET prep_status = 'waiting' WHERE status IN ('accepted','paid') AND prep_status IS NULL");
+}
+
 function migrateOrderItemsSource(db) {
   const itemsInfo = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'order_items'").get();
   if (!itemsInfo) return;
@@ -115,6 +130,7 @@ export function openDb(dbPath) {
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA foreign_keys = ON;');
   migrateLegacyOrders(db);
+  migrateOrdersPrepStatus(db);
   migrateOrderItemsSource(db);
   db.exec(SCHEMA);
   // Carry forward the latest addition id from installations that briefly used

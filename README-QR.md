@@ -99,15 +99,65 @@ credentials over plain HTTP. **Do not serve this with
 static hosting alone** — the backend (API + SQLite) is an integral server
 process; static hosts cannot run it.
 
-## Backups
+## Optional kitchen and per-order receipts
 
-All **new QR/manual table/menu/order/payment** state lives in the SQLite file (plus `-wal`/`-shm` WAL
-sidecars). Pre-existing POS data and checkout/sales remain in the same admin
-browser's `localStorage`; another browser/device will not inherit them. To back
-up: stop the server (or use `sqlite3 db '.backup ...'` / copy all three files
-together). Restore by placing the file(s) and restarting. Sessions are
-in-memory, so admins must log in again after a restart; tables, menu, and
-orders persist.
+The cashier queue remains the primary order screen. The kitchen section in
+Orders is collapsed by default; accepted or paid orders can advance through
+waiting → preparing → ready → served independently of payment. You can ignore
+it if there is no kitchen station. A paid order has its own **Print / Save PDF**
+button in the cashier queue. This prints only that order's items and payment;
+people at the same table are never combined. Browser print supports Save as
+PDF. This receipt is **not a fiscal/tax document**.
+
+## Optional QR arrival alerts
+
+The cashier order queue has a session-local, opt-in alert toggle. It requests
+browser notification permission only when clicked. New **pending QR guest**
+orders appear in a dismissible in-app badge; if browser permission is granted,
+a generic OS notification also appears without names or order contents. It
+never alerts for initial page hydration, old orders or manually created cashier
+orders. Browser permission denied/unsupported does not disable the in-app
+badge. The page must remain open and authenticated; there is no background
+push or sound, and alerts are disabled again on reload.
+
+## Backups: two separate data stores
+
+Sessions are in-memory, so admins must log in again after a server restart;
+tables, menu, and orders persist.
+
+The QR and cashier tables, menu, orders, and payments live in SQLite. Older POS
+sales, checkout, and settings live only in each admin browser's `localStorage`.
+**Neither backup includes the other store.** Export and import legacy browser
+records from Settings separately, using the same browser account; check the
+file before confirming replacement. SQLite backups contain customer data:
+keep them offline and encrypted, and never commit them to Git.
+
+### Consistent online SQLite backup
+
+```sh
+node scripts/restaurant-backup.mjs backup --db data/restaurant.sqlite --out /safe/offline/place/restaurant-backup.sqlite
+```
+
+The command uses SQLite's online backup API (including committed WAL data),
+refuses an existing destination, creates an owner-only file, and checks its
+integrity. Verify your `DB_PATH` setting and choose a new output filename for
+each backup; this does not automate backups.
+
+### Guarded offline restore
+
+Stop the restaurant server and rehearse on a disposable copy first. Then, for
+an **existing** target database, explicitly confirm:
+
+```sh
+node scripts/restaurant-backup.mjs restore --from /safe/offline/place/restaurant-backup.sqlite --to data/restaurant.sqlite --confirm-restore
+```
+
+The command checks source integrity, schema, and foreign keys before modifying
+the target; refuses symlinked source/target files, WAL/SHM sidecars, and locks;
+retains an owner-only `*.pre-restore.*.bak` rollback copy next to the original;
+and stages a verified replacement before swapping. It cannot prove that a
+separate process will not start between the lock check and swap: keep the
+server **stopped for the entire restore**. No copy is deleted automatically.
 
 ## Limitations (read before trusting this)
 

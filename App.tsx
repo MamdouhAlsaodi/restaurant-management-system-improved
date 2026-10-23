@@ -3,18 +3,23 @@ import React, { useState, useEffect } from 'react';
 import { MenuItem, Order, Settings, Discount, DailySalesRecord, OrderItem, Language } from './types';
 import { CATEGORIES, formatDate, getItemPrice, SPECIAL_MENU_CATEGORY } from './utils/helpers';
 import { apiFetch } from './utils/qr/api';
+import { parseLegacyBackup, restoreLegacyBackup } from './utils/legacyBackup';
 import {
   ServerOrder,
+  PrepStatus,
   canAddItems,
   canApprove,
   canCheckout,
+  canSetPreparation,
   combineForReporting,
   isPaid,
   mapServerOrder,
   retryPersistedWrite,
 } from './utils/qr/adminOrders';
 import { PublishedMenuItem } from './utils/qr/helpers';
+import { ArrivalAlertCenter } from './utils/qr/arrivalAlerts';
 import OrderInbox, { InboxTable } from './components/qr/OrderInbox';
+import KitchenPanel from './components/qr/KitchenPanel';
 import { translations } from './utils/translations';
 import MenuView from './components/views/MenuView';
 import SalesView from './components/views/SalesView';
@@ -52,6 +57,14 @@ const App = () => {
   const [publishedMenu, setPublishedMenu] = useState<PublishedMenuItem[]>([]);
   const [checkoutServerOrder, setCheckoutServerOrder] = useState<ServerOrder | null>(null);
 
+  // Optional QR arrivals: in-memory opt-in, never blocks order polling.
+  const arrivalCenterRef = React.useRef<ArrivalAlertCenter | null>(null);
+  if (!arrivalCenterRef.current) arrivalCenterRef.current = new ArrivalAlertCenter();
+  const arrivalCenter = arrivalCenterRef.current;
+  const initialOrdersLoadedRef = React.useRef(false);
+  const [alertsEnabled, setAlertsEnabled] = useState(false);
+  const [newAlertIds, setNewAlertIds] = useState<string[]>([]);
+
   const language: Language = settings.language || 'ar';
   const t = translations[language];
 
@@ -88,8 +101,21 @@ const App = () => {
   const refreshServerOrders = async () => {
     try {
       const data = await apiFetch<{ orders: any[] }>('/api/admin/orders');
-      setServerOrders((data.orders ?? []).map(mapServerOrder));
+      const mapped = (data.orders ?? []).map(mapServerOrder);
+      setServerOrders(mapped);
       setServerLoadError('');
+      try {
+        // Even when the user enabled alerts before the initial fetch resolved,
+        // historical pending orders are baseline, not new arrivals.
+        if (!initialOrdersLoadedRef.current) {
+          arrivalCenter.syncBaseline(mapped);
+          initialOrdersLoadedRef.current = true;
+        }
+        const arrivals = arrivalCenter.processOrders(mapped);
+        if (arrivals.length > 0) {
+          setNewAlertIds((prev) => Array.from(new Set([...prev, ...arrivals.map((a) => a.id)])));
+        }
+      } catch { /* alert failures must not break polling */ }
     } catch (err: any) {
       setServerLoadError(err?.message ?? 'تعذر تحميل الطلبات');
     }
@@ -114,6 +140,19 @@ const App = () => {
   }, []);
 
   const selectedServerOrder = serverOrders.find((o) => o.id === selectedServerId) ?? null;
+
+  const handleToggleAlerts = () => {
+    if (alertsEnabled) {
+      arrivalCenter.disable();
+      setAlertsEnabled(false);
+      setNewAlertIds([]);
+      return;
+    }
+    arrivalCenter.syncBaseline(serverOrders);
+    void arrivalCenter.requestEnable().then(() => setAlertsEnabled(true));
+  };
+
+  const handleDismissAlerts = () => setNewAlertIds([]);
 
   const mergeServerOrder = (order: ServerOrder) => {
     setServerOrders((prev) => {
@@ -144,6 +183,19 @@ const App = () => {
         return;
       }
       const data = await apiFetch<{ order: any }>(`/api/admin/orders/${order.id}/${action}`, { method: 'POST' });
+      mergeServerOrder(mapServerOrder(data.order));
+    });
+
+  const handleSetPreparation = (order: ServerOrder, next: PrepStatus) =>
+    withServerAction(order, async () => {
+      if (!canSetPreparation(order)) {
+        setServerActionError('لا يمكن تحديث حالة المطبخ لطلب معلّق أو مرفوض أو تم تقديمه');
+        return;
+      }
+      const data = await apiFetch<{ order: any }>(`/api/admin/orders/${order.id}/preparation`, {
+        method: 'POST',
+        body: { status: next },
+      });
       mergeServerOrder(mapServerOrder(data.order));
     });
 
@@ -294,19 +346,23 @@ const App = () => {
     const file = e.target.files?.[0];
     if (!file) return;
     try {
+      if (file.size > 20_000_000) throw new Error('backup too large');
       const text = await file.text();
-      const data = JSON.parse(text);
-      if (data.menuItems) handleUpdateMenuItems(data.menuItems);
-      if (data.completedOrders) handleUpdateOrders(data.completedOrders);
-      if (data.settings) handleUpdateSettings(data.settings);
-      if (data.discounts) handleUpdateDiscounts(data.discounts);
-      if (data.dailySalesRecords) {
-          setDailySalesRecords(data.dailySalesRecords);
-          saveData('restaurant-daily-sales', data.dailySalesRecords);
-      }
+      const data = parseLegacyBackup(text);
+      if (!window.confirm(language === 'ar'
+        ? 'استعادة النسخة ستستبدل بيانات المبيعات والقائمة المحلية على هذا المتصفح. احتفظ بنسخة حالية أولاً. متابعة؟'
+        : 'Restoring replaces local sales and menu on this browser. Back up current data first. Continue?')) return;
+      restoreLegacyBackup(data, localStorage);
+      setMenuItems(data.menuItems);
+      setCompletedOrders(data.completedOrders);
+      setSettings(data.settings);
+      setDiscounts(data.discounts);
+      setDailySalesRecords(data.dailySalesRecords);
       alert('✅ ' + (language === 'ar' ? 'تم استيراد البيانات بنجاح' : 'Data imported successfully'));
     } catch (err) {
-      alert('❌ ' + (language === 'ar' ? 'خطأ في الملف' : 'File error'));
+      alert('❌ ' + (language === 'ar' ? 'تعذرت الاستعادة: الملف غير صالح أو فشل حفظ البيانات. لم تُعدّل الطلبات على الخادم.' : 'Restore failed: invalid backup or storage error. Server orders were not modified.'));
+    } finally {
+      e.target.value = '';
     }
   };
 
@@ -327,6 +383,7 @@ const App = () => {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const totalItemsInCart = currentOrder.reduce((acc, item) => acc + item.quantity, 0);
@@ -354,6 +411,10 @@ const App = () => {
     onCreateManual: handleCreateManualOrder,
     onAddItems: handleAddServerItems,
     onCheckout: (o: ServerOrder) => setCheckoutServerOrder(o),
+    alertsEnabled,
+    newAlertCount: newAlertIds.length,
+    onToggleAlerts: handleToggleAlerts,
+    onDismissAlerts: handleDismissAlerts,
   };
 
   return (
@@ -509,6 +570,13 @@ const App = () => {
           <>
             {/* Primary multi-order queue: order cards, approve/reject, per-order checkout */}
             <OrderInbox {...inboxProps} />
+            {/* Optional kitchen subview: cashier queue stays primary. */}
+            <KitchenPanel
+              orders={serverOrders}
+              actionError={serverActionError}
+              busyOrderId={busyServerId}
+              onSetPreparation={handleSetPreparation}
+            />
             <h2 style={{ margin: '32px 0 8px', fontSize: 18, color: '#374151' }}>المبيعات المحلية القديمة (Legacy)</h2>
             <OrdersView
             orders={completedOrders}
