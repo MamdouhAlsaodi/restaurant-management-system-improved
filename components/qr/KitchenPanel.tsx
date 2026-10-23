@@ -14,6 +14,8 @@ export interface KitchenPanelProps {
   actionError: string;
   busyOrderId: string | null;
   onSetPreparation: (order: ServerOrder, next: PrepStatus) => void;
+  /** Open by default only in the dedicated kitchen-staff workspace. */
+  defaultExpanded?: boolean;
 }
 
 const PREP_LABELS: Record<PrepStatus, string> = {
@@ -37,8 +39,8 @@ const PREP_COLORS: Record<PrepStatus, { bg: string; color: string }> = {
  * persisted preparation state. It polls nothing by itself — it renders the
  * same 5s admin poll data the rest of the app uses, and reports errors.
  */
-const KitchenPanel = ({ orders, actionError, busyOrderId, onSetPreparation }: KitchenPanelProps) => {
-  const [expanded, setExpanded] = useState<boolean>(false);
+const KitchenPanel = ({ orders, actionError, busyOrderId, onSetPreparation, defaultExpanded = false }: KitchenPanelProps) => {
+  const [expanded, setExpanded] = useState<boolean>(defaultExpanded);
   const kitchen = kitchenOrders(orders);
 
   return (

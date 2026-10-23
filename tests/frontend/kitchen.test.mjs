@@ -69,8 +69,10 @@ test('App renders KitchenPanel in the Orders tab after the primary cashier queue
   assert.ok(kitchen > inbox, 'KitchenPanel comes after OrderInbox');
 });
 
-test('KitchenPanel is collapsed by default (off by default)', () => {
+test('KitchenPanel is collapsed for owner by default and open in the dedicated kitchen workspace', () => {
   const src = read('./components/qr/KitchenPanel.tsx');
-  assert.ok(/useState(<boolean>)?\(false\)/.test(src), 'expanded state must default to false');
+  assert.match(src, /defaultExpanded = false/, 'owner view must default to false');
+  assert.match(src, /useState(<boolean>)?\(defaultExpanded\)/);
+  assert.match(read('./components/qr/StaffWorkspace.tsx'), /<KitchenPanel[^>]+defaultExpanded/);
   assert.ok(/kitchenOrders|canSetPreparation|nextPrepStatus/.test(src), 'uses the shared pure helpers');
 });

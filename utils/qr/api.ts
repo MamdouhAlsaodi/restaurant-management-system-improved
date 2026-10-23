@@ -14,6 +14,11 @@ export class ApiError extends Error {
 
 type FetchLike = typeof fetch;
 
+/** Session actor metadata exposed by GET /api/admin/session. */
+export type SessionActor =
+  | { kind: 'owner'; role: 'owner' }
+  | { kind: 'staff'; id: number; username: string; role: 'cashier' | 'kitchen' };
+
 export async function apiFetch<T = unknown>(
   path: string,
   options: { method?: string; body?: unknown } = {},

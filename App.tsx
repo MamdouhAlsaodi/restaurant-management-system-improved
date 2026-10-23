@@ -2,7 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import { MenuItem, Order, Settings, Discount, DailySalesRecord, OrderItem, Language } from './types';
 import { CATEGORIES, formatDate, getItemPrice, SPECIAL_MENU_CATEGORY } from './utils/helpers';
-import { apiFetch } from './utils/qr/api';
+import { apiFetch, SessionActor } from './utils/qr/api';
 import { parseLegacyBackup, restoreLegacyBackup } from './utils/legacyBackup';
 import {
   ServerOrder,
@@ -31,14 +31,16 @@ import CartModal from './components/modals/CartModal';
 import SettingsModal from './components/modals/SettingsModal';
 import DiscountsModal from './components/modals/DiscountsModal';
 import QRPanel from './components/qr/QRPanel';
+import StaffPanel from './components/qr/StaffPanel';
 import { Settings as SettingsIcon, ShoppingCart } from 'lucide-react';
 
-const App = () => {
+const App = ({ actor }: { actor: SessionActor }) => {
+  const isOwner = actor.kind === 'owner';
   const [menuItems, setMenuItems] = useState<MenuItem[]>([]);
   const [currentOrder, setCurrentOrder] = useState<OrderItem[]>([]);
   const [completedOrders, setCompletedOrders] = useState<Order[]>([]);
   const [discounts, setDiscounts] = useState<Discount[]>([]);
-  const [view, setView] = useState<'menu' | 'sales' | 'orders' | 'history' | 'qr'>('menu');
+  const [view, setView] = useState<'menu' | 'sales' | 'orders' | 'history' | 'qr' | 'staff'>('menu');
   const [showAddItem, setShowAddItem] = useState(false);
   const [showCart, setShowCart] = useState(false);
   const [showCheckout, setShowCheckout] = useState(false);
@@ -464,6 +466,9 @@ const App = () => {
                 <button onClick={() => setView('orders')} className={`py-3 px-2 font-bold text-sm border-b-2 transition-colors whitespace-nowrap ${view === 'orders' ? 'border-orange-500 text-orange-600' : 'border-transparent text-gray-500 hover:text-gray-800'}`}>🕐 {t.orders}</button>
                 <button onClick={() => setView('history')} className={`py-3 px-2 font-bold text-sm border-b-2 transition-colors whitespace-nowrap ${view === 'history' ? 'border-orange-500 text-orange-600' : 'border-transparent text-gray-500 hover:text-gray-800'}`}>📜 {t.history}</button>
                 <button onClick={() => setView('qr')} className={`py-3 px-2 font-bold text-sm border-b-2 transition-colors whitespace-nowrap ${view === 'qr' ? 'border-orange-500 text-orange-600' : 'border-transparent text-gray-500 hover:text-gray-800'}`}>📱 طاولات QR</button>
+                {isOwner && (
+                  <button onClick={() => setView('staff')} className={`py-3 px-2 font-bold text-sm border-b-2 transition-colors whitespace-nowrap ${view === 'staff' ? 'border-orange-500 text-orange-600' : 'border-transparent text-gray-500 hover:text-gray-800'}`}>👥 الحسابات والتدقيق</button>
+                )}
 
                 <div className="ms-auto flex items-center gap-2 py-2">
                     <button onClick={() => setShowDiscounts(true)} className="px-3 py-1.5 text-xs font-bold bg-red-50 text-red-600 rounded-lg hover:bg-red-100 transition-colors">🏷️ {t.discounts}</button>
@@ -637,6 +642,7 @@ const App = () => {
         {/* QR tables + the same authenticated order queue. Pending guest orders
             are never counted as paid and never inserted into local sales. */}
         {view === 'qr' && <QRPanel menuItems={menuItems} inbox={inboxProps} paidServerCount={paidServerCount} onMetaChange={refreshInboxMeta} />}
+        {view === 'staff' && isOwner && <StaffPanel actor={actor} />}
       </main>
 
       {/* Modals */}

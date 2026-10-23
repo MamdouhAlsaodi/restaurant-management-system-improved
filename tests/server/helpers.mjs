@@ -49,6 +49,34 @@ export async function startTestServer({ staticDir, secureCookies = false } = {})
     return cookie;
   };
 
+  state.staffFetch = async function staffFetch(cookie, path, opts = {}) {
+    const headers = {
+      'Content-Type': 'application/json',
+      Origin: base,
+      Cookie: cookie,
+      ...(opts.headers ?? {}),
+    };
+    return fetch(`${base}${path}`, { ...opts, headers });
+  };
+
+  state.createStaff = async function createStaff({ username, password, role }) {
+    const res = await state.adminFetch('/api/admin/staff', {
+      method: 'POST',
+      body: JSON.stringify({ username, password, role }),
+    });
+    if (res.status !== 201) throw new Error(`staff create failed: ${res.status} ${await res.text()}`);
+    return res.json();
+  };
+
+  state.staffLogin = async function staffLogin(username, password) {
+    const res = await fetch(`${base}/api/admin/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: base },
+      body: JSON.stringify({ username, password }),
+    });
+    return { status: res.status, cookie: res.headers.get('set-cookie')?.split(';')[0] ?? '', body: await res.json() };
+  };
+
   state.adminFetch = async function adminFetch(path, opts = {}) {
     const cookie = await loginCookieCache(state);
     const headers = {
