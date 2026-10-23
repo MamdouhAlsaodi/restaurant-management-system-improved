@@ -1,0 +1,5 @@
+{
+  "name": "Restaurant Management System",
+  "description": "A comprehensive React application for managing restaurant orders, menu items, sales analytics, and settings with local storage persistence.",
+  "requestFramePermissions": []
+}
