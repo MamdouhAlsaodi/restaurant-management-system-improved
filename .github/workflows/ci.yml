@@ -1,0 +1,21 @@
+name: QR orders checks
+
+on:
+  push:
+    branches: [main, feat/table-qr-orders]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npx --no-install tsc --noEmit
+      - run: npm run build
+      - run: node --test tests/frontend/*.test.mjs tests/server/*.test.mjs
+      - run: npm audit --omit=dev

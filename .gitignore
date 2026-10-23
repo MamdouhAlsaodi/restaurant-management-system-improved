@@ -8,8 +8,14 @@ build/
 
 # Environment / secrets
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+
+# SQLite databases (server data)
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 
 # Logs
 npm-debug.log*

@@ -12,6 +12,7 @@ import CheckoutModal from './components/modals/CheckoutModal';
 import CartModal from './components/modals/CartModal';
 import SettingsModal from './components/modals/SettingsModal';
 import DiscountsModal from './components/modals/DiscountsModal';
+import QRPanel from './components/qr/QRPanel';
 import { Settings as SettingsIcon, ShoppingCart } from 'lucide-react';
 
 const App = () => {
@@ -19,7 +20,7 @@ const App = () => {
   const [currentOrder, setCurrentOrder] = useState<OrderItem[]>([]);
   const [completedOrders, setCompletedOrders] = useState<Order[]>([]);
   const [discounts, setDiscounts] = useState<Discount[]>([]);
-  const [view, setView] = useState<'menu' | 'sales' | 'orders' | 'history'>('menu');
+  const [view, setView] = useState<'menu' | 'sales' | 'orders' | 'history' | 'qr'>('menu');
   const [showAddItem, setShowAddItem] = useState(false);
   const [showCart, setShowCart] = useState(false);
   const [showCheckout, setShowCheckout] = useState(false);
@@ -227,6 +228,7 @@ const App = () => {
                 <button onClick={() => setView('sales')} className={`py-3 px-2 font-bold text-sm border-b-2 transition-colors whitespace-nowrap ${view === 'sales' ? 'border-orange-500 text-orange-600' : 'border-transparent text-gray-500 hover:text-gray-800'}`}>📈 {t.sales}</button>
                 <button onClick={() => setView('orders')} className={`py-3 px-2 font-bold text-sm border-b-2 transition-colors whitespace-nowrap ${view === 'orders' ? 'border-orange-500 text-orange-600' : 'border-transparent text-gray-500 hover:text-gray-800'}`}>🕐 {t.orders}</button>
                 <button onClick={() => setView('history')} className={`py-3 px-2 font-bold text-sm border-b-2 transition-colors whitespace-nowrap ${view === 'history' ? 'border-orange-500 text-orange-600' : 'border-transparent text-gray-500 hover:text-gray-800'}`}>📜 {t.history}</button>
+                <button onClick={() => setView('qr')} className={`py-3 px-2 font-bold text-sm border-b-2 transition-colors whitespace-nowrap ${view === 'qr' ? 'border-orange-500 text-orange-600' : 'border-transparent text-gray-500 hover:text-gray-800'}`}>📱 طاولات QR</button>
 
                 <div className="ms-auto flex items-center gap-2 py-2">
                     <button onClick={() => setShowDiscounts(true)} className="px-3 py-1.5 text-xs font-bold bg-red-50 text-red-600 rounded-lg hover:bg-red-100 transition-colors">🏷️ {t.discounts}</button>
@@ -380,6 +382,11 @@ const App = () => {
             })()}
           />
         )}
+
+        {/* QR table orders: pending guest orders are never counted as paid and
+            never inserted into local sales. Checkout/payment integration is
+            future work. */}
+        {view === 'qr' && <QRPanel menuItems={menuItems} />}
       </main>
 
       {/* Modals */}
