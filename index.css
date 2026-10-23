@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Preserved visual styles previously inlined in index.html (self-hosted, CSP-safe). */
+body {
+  font-family: 'Tajawal', ui-sans-serif, system-ui, sans-serif;
+  background: linear-gradient(135deg, #fff5f0 0%, #ffe8e0 100%);
+}
+
+.glass-effect {
+  background: rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.hover-lift {
+  transition: all 0.3s ease;
+}
+
+.hover-lift:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 15px 40px rgba(0, 0, 0, 0.15);
+}
+
+/* Custom utility already referenced by existing TSX; defined locally since the
+   CDN that previously served it is blocked by CSP. */
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
