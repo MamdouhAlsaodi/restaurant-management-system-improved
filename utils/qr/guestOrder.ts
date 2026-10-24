@@ -31,8 +31,27 @@ interface GuestOrder {
   [key: string]: unknown;
 }
 
+/**
+ * Guest name is required per QR submission (not account login). Validated and
+ * trimmed client-side; must match the server contract (nonempty, <= 80 chars).
+ */
+export function validateGuestName(value: unknown): string {
+  if (typeof value !== 'string') {
+    throw new GuestOrderSubmitError('الاسم مطلوب لإرسال الطلب', false);
+  }
+  const name = value.trim();
+  if (name.length === 0) {
+    throw new GuestOrderSubmitError('الاسم مطلوب لإرسال الطلب', false);
+  }
+  if (name.length > 80) {
+    throw new GuestOrderSubmitError('الاسم يجب أن يكون 80 حرفاً أو أقل', false);
+  }
+  return name;
+}
+
 interface SubmitArgs {
   token: string;
+  guestName: string;
   items: { id: string; quantity: number }[];
   notes?: string;
   requestId: string;
@@ -42,15 +61,20 @@ interface SubmitArgs {
 
 export async function submitGuestOrder({
   token,
+  guestName,
   items,
   notes,
   requestId,
   attempts = 3,
   fetchImpl = fetch,
 }: SubmitArgs): Promise<GuestOrder> {
+  // Fail fast (no network call) on an invalid guest name.
+  const name = validateGuestName(guestName);
   // Frozen snapshot of exactly one attempted order: retries always send this
-  // byte-identical body with the same requestId.
+  // byte-identical body with the same requestId. guestName is part of the
+  // snapshot and travels verbatim on every retry.
   const body = JSON.stringify({
+    guestName: name,
     items,
     ...(notes ? { notes } : {}),
     requestId,

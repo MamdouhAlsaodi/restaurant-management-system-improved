@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import { apiFetch } from '../../utils/qr/api';
-import { canActOnOrder, describeOrderStatus, formatBRL, guestUrl, mergeOrders, toPublishedItems } from '../../utils/qr/helpers';
+import { guestUrl, toPublishedItems } from '../../utils/qr/helpers';
 import { MenuItem } from '../../types';
+import OrderInbox, { OrderInboxProps } from './OrderInbox';
 
 interface AdminTable {
   id: number | string;
@@ -11,27 +12,15 @@ interface AdminTable {
   active: boolean;
 }
 
-interface AdminOrder {
-  /** Backend order ids are UUID strings. */
-  id: string;
-  tableLabel: string;
-  items: { id: string; name: string; price: number; quantity: number }[];
-  /** INTEGER CENTS from the API. */
-  total: number;
-  notes?: string;
-  status: string;
-  createdAt: string;
+interface QRPanelProps {
+  menuItems: MenuItem[];
+  /** Shared, App-owned order queue state (single poller, single source of truth). */
+  inbox: OrderInboxProps;
+  paidServerCount: number;
+  onMetaChange: () => Promise<void>;
 }
 
-const POLL_INTERVAL_MS = 5000;
-
-/**
- * QR orders panel inside the authenticated admin App.
- * NOTE: pending QR orders are NOT sales. They are never counted as paid and
- * never inserted into local sales records. Checkout/payment integration for
- * guest QR orders is future work.
- */
-const QRPanel = ({ menuItems }: { menuItems: MenuItem[] }) => {
+const QRPanel = ({ menuItems, inbox, paidServerCount, onMetaChange }: QRPanelProps) => {
   const [tables, setTables] = useState<AdminTable[]>([]);
   const [newLabel, setNewLabel] = useState('');
   const [qrImages, setQrImages] = useState<Record<string, string>>({});
@@ -39,12 +28,7 @@ const QRPanel = ({ menuItems }: { menuItems: MenuItem[] }) => {
 
   const [publishing, setPublishing] = useState(false);
   const [publishMsg, setPublishMsg] = useState('');
-
-  const [orders, setOrders] = useState<AdminOrder[]>([]);
-  const [ordersError, setOrdersError] = useState('');
-  const [actingId, setActingId] = useState<string | null>(null);
   const [copiedToken, setCopiedToken] = useState<string | null>(null);
-  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const loadTables = useCallback(async () => {
     try {
@@ -56,24 +40,9 @@ const QRPanel = ({ menuItems }: { menuItems: MenuItem[] }) => {
     }
   }, []);
 
-  const loadOrders = useCallback(async () => {
-    try {
-      const data = await apiFetch<{ orders: AdminOrder[] }>('/api/admin/orders');
-      setOrders((prev) => mergeOrders(prev, data.orders ?? []));
-      setOrdersError('');
-    } catch (err: any) {
-      setOrdersError(err?.message ?? 'تعذر تحميل الطلبات');
-    }
-  }, []);
-
   useEffect(() => {
     loadTables();
-    loadOrders();
-    pollTimer.current = setInterval(loadOrders, POLL_INTERVAL_MS);
-    return () => {
-      if (pollTimer.current) clearInterval(pollTimer.current);
-    };
-  }, [loadTables, loadOrders]);
+  }, [loadTables]);
 
   // Render QR images locally with the qrcode package (no remote QR service).
   useEffect(() => {
@@ -105,6 +74,7 @@ const QRPanel = ({ menuItems }: { menuItems: MenuItem[] }) => {
       await apiFetch('/api/admin/tables', { method: 'POST', body: { label } });
       setNewLabel('');
       await loadTables();
+      await onMetaChange();
     } catch (err: any) {
       setTablesError(err?.message ?? 'تعذر إنشاء الطاولة');
     }
@@ -115,6 +85,7 @@ const QRPanel = ({ menuItems }: { menuItems: MenuItem[] }) => {
     try {
       await apiFetch(`/api/admin/tables/${table.id}`, { method: 'DELETE' });
       await loadTables();
+      await onMetaChange();
     } catch (err: any) {
       setTablesError(err?.message ?? 'تعذر إلغاء الطاولة');
     }
@@ -144,27 +115,12 @@ const QRPanel = ({ menuItems }: { menuItems: MenuItem[] }) => {
         method: 'PUT',
         body: { items: payload },
       });
+      await onMetaChange();
       setPublishMsg('✅ تم نشر القائمة للضيوف');
     } catch (err: any) {
       setPublishMsg(`⚠️ ${err?.message ?? 'تعذر نشر القائمة'}`);
     } finally {
       setPublishing(false);
-    }
-  };
-
-  const handleAct = async (order: AdminOrder, action: 'accept' | 'reject') => {
-    if (!canActOnOrder(order) || actingId !== null) return;
-    setActingId(order.id);
-    try {
-      const data = await apiFetch<{ order: AdminOrder }>(`/api/admin/orders/${order.id}/${action}`, {
-        method: 'POST',
-      });
-      setOrders((prev) => mergeOrders(prev, [data.order]));
-      setOrdersError('');
-    } catch (err: any) {
-      setOrdersError(err?.message ?? 'تعذر تحديث الطلب');
-    } finally {
-      setActingId(null);
     }
   };
 
@@ -181,10 +137,20 @@ const QRPanel = ({ menuItems }: { menuItems: MenuItem[] }) => {
 
   return (
     <div dir="rtl" style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+      {/* Primary multi-order queue (shared with the Orders tab). Auth is the
+          same admin cookie session gating the whole App — never bypassed. */}
+      <section>
+        <h2>طلبات الطاولات (تحديث تلقائي كل 5 ثوانٍ)</h2>
+        <p style={{ color: '#6b7280', fontSize: 14 }}>
+          الطلبات المعلّقة ليست مبيعات. يُحصّل كل طلب على حدة، والطلبات المدفوعة ({paidServerCount}) للقراءة فقط ولا تُكتب في السجل المحلي.
+        </p>
+        <OrderInbox {...inbox} />
+      </section>
+
       <section>
         <h2>نشر القائمة للضيوف</h2>
         <p style={{ color: '#6b7280', fontSize: 14 }}>
-          النشر ينشئ نسخة ثابتة من القائمة الحالية. أسعار الضيوف لن تتغير حتى تنشر مرة أخرى.
+          النشر ينشئ نسخة ثابتة من القائمة الحالية. أسعار الضيوف وإضافات الكاشير للطلبات تستخدم هذه النسخة المنشورة فقط.
         </p>
         <button
           onClick={handlePublish}
@@ -238,65 +204,6 @@ const QRPanel = ({ menuItems }: { menuItems: MenuItem[] }) => {
             </div>
           ))}
           {tables.length === 0 && !tablesError && <p style={{ color: '#6b7280' }}>لا توجد طاولات بعد.</p>}
-        </div>
-      </section>
-
-      <section>
-        <h2>طلبات الضيوف (تحديث تلقائي كل 5 ثوانٍ)</h2>
-        <p style={{ color: '#6b7280', fontSize: 14 }}>
-          الطلبات المعلّقة ليست مبيعات: لا تُحسب كمدفوعات ولا تُضاف إلى السجل المحلي. ربط الدفع عند Checkout عمل مستقبلي.
-        </p>
-        {ordersError && <p style={{ color: '#b91c1c' }}>⚠️ خطأ في جلب الطلبات: {ordersError}</p>}
-        {orders.length === 0 && !ordersError && <p style={{ color: '#6b7280' }}>لا توجد طلبات حالياً.</p>}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {orders.map((order) => (
-            <div key={order.id} style={{ border: '1px solid #ddd', borderRadius: 10, padding: 12 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
-                <strong>طلب #{order.id} — {order.tableLabel}</strong>
-                <span
-                  style={{
-                    padding: '2px 10px',
-                    borderRadius: 999,
-                    fontSize: 13,
-                    background: order.status === 'accepted' ? '#d1fae5' : order.status === 'rejected' ? '#fee2e2' : '#fef3c7',
-                    color: order.status === 'accepted' ? '#065f46' : order.status === 'rejected' ? '#991b1b' : '#92400e',
-                  }}
-                >
-                  {describeOrderStatus(order.status)}
-                </span>
-              </div>
-              <ul style={{ margin: '8px 0', paddingLeft: 0, paddingRight: 18, listStyle: 'disc' }}>
-                {order.items.map((item, idx) => (
-                  <li key={idx}>
-                    {item.name} × {item.quantity} — {formatBRL(item.price * item.quantity)}
-                  </li>
-                ))}
-              </ul>
-              <div>الإجمالي: {formatBRL(order.total)}</div>
-              {order.notes && <div style={{ color: '#6b7280', fontSize: 14 }}>ملاحظات: {order.notes}</div>}
-              <div style={{ color: '#6b7280', fontSize: 13 }}>
-                {order.createdAt ? new Date(order.createdAt).toLocaleString('ar') : ''}
-              </div>
-              {canActOnOrder(order) && (
-                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                  <button
-                    onClick={() => handleAct(order, 'accept')}
-                    disabled={actingId === order.id}
-                    style={{ padding: '6px 14px', borderRadius: 8, border: 'none', background: '#059669', color: '#fff', fontWeight: 700 }}
-                  >
-                    قبول
-                  </button>
-                  <button
-                    onClick={() => handleAct(order, 'reject')}
-                    disabled={actingId === order.id}
-                    style={{ padding: '6px 14px', borderRadius: 8, border: '1px solid #b91c1c', background: 'transparent', color: '#b91c1c' }}
-                  >
-                    رفض
-                  </button>
-                </div>
-              )}
-            </div>
-          ))}
         </div>
       </section>
     </div>

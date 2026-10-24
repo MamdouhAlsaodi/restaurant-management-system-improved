@@ -59,6 +59,7 @@ test('guest order is priced server-side and appears in admin queue', async () =>
           { id: 'cola', quantity: 1 },
         ],
         notes: 'no onions',
+        guestName: 'Guest',
         requestId,
       }),
     });
@@ -68,8 +69,8 @@ test('guest order is priced server-side and appears in admin queue', async () =>
     assert.equal(order.tableLabel, 'T1');
     assert.equal(order.total, 2050); // 2*900 + 250 cents
     assert.deepEqual(order.items, [
-      { id: 'pizza', name: 'Margherita', price: 900, quantity: 2 },
-      { id: 'cola', name: 'Cola', price: 250, quantity: 1 },
+      { id: 'pizza', name: 'Margherita', price: 900, quantity: 2, source: 'guest' },
+      { id: 'cola', name: 'Cola', price: 250, quantity: 1, source: 'guest' },
     ]);
 
     const queue = await s.adminFetch('/api/admin/orders');
@@ -90,6 +91,7 @@ test('duplicate requestId returns same order with 200', async () => {
     const requestId = randomUUID();
     const payload = {
       items: [{ id: 'pizza', quantity: 1 }],
+        guestName: 'Guest',
       requestId,
     };
     const first = await fetch(`${s.base}/api/guest/${table.token}/orders`, {
@@ -124,9 +126,9 @@ test('guest order validation rejects unsafe input', async () => {
         ...opts,
       });
 
-    assert.equal((await post({ items: [], requestId: randomUUID() })).status, 400, 'empty order');
+    assert.equal((await post({ items: [], guestName: 'Guest', requestId: randomUUID() })).status, 400, 'empty order');
     assert.equal(
-      (await post({ items: [{ id: 'ghost', quantity: 1 }], requestId: randomUUID() })).status,
+      (await post({ items: [{ id: 'ghost', quantity: 1 }], guestName: 'Guest', requestId: randomUUID() })).status,
       400,
       'unknown item'
     );
@@ -136,18 +138,18 @@ test('guest order validation rejects unsafe input', async () => {
           { id: 'pizza', quantity: 1 },
           { id: 'pizza', quantity: 2 },
         ],
-        requestId: randomUUID(),
+        guestName: 'Guest', requestId: randomUUID(),
       })).status,
       400,
       'duplicate item'
     );
     assert.equal(
-      (await post({ items: [{ id: 'pizza', quantity: 0 }], requestId: randomUUID() })).status,
+      (await post({ items: [{ id: 'pizza', quantity: 0 }], guestName: 'Guest', requestId: randomUUID() })).status,
       400,
       'invalid quantity'
     );
     assert.equal(
-      (await post({ items: [{ id: 'pizza', quantity: 1.5 }], requestId: randomUUID() })).status,
+      (await post({ items: [{ id: 'pizza', quantity: 1.5 }], guestName: 'Guest', requestId: randomUUID() })).status,
       400,
       'fractional quantity'
     );
@@ -157,7 +159,7 @@ test('guest order validation rejects unsafe input', async () => {
       'requestId must be UUID'
     );
     assert.equal(
-      (await post({ items: [{ id: 'pizza', quantity: 1 }], requestId: randomUUID(), notes: 'x'.repeat(600) }))
+      (await post({ items: [{ id: 'pizza', quantity: 1 }], guestName: 'Guest', requestId: randomUUID(), notes: 'x'.repeat(600) }))
         .status,
       400,
       'oversize notes'
@@ -165,7 +167,7 @@ test('guest order validation rejects unsafe input', async () => {
     const big = await fetch(`${s.base}/api/guest/${table.token}/orders`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Origin: s.base },
-      body: JSON.stringify({ items: [{ id: 'pizza', quantity: 1 }], requestId: randomUUID() }) + 'x'.repeat(100_000),
+      body: JSON.stringify({ items: [{ id: 'pizza', quantity: 1 }], guestName: 'Guest', requestId: randomUUID() }) + 'x'.repeat(100_000),
     });
     assert.equal(big.status, 413, 'oversize payload');
   } finally {
@@ -181,7 +183,7 @@ test('revoked token cannot submit orders', async () => {
     const res = await fetch(`${s.base}/api/guest/${table.token}/orders`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Origin: s.base },
-      body: JSON.stringify({ items: [{ id: 'pizza', quantity: 1 }], requestId: randomUUID() }),
+      body: JSON.stringify({ items: [{ id: 'pizza', quantity: 1 }], guestName: 'Guest', requestId: randomUUID() }),
     });
     assert.equal(res.status, 404);
   } finally {
@@ -198,7 +200,7 @@ test('guest submissions are rate limited', async () => {
       last = await fetch(`${s.base}/api/guest/${table.token}/orders`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Origin: s.base },
-        body: JSON.stringify({ items: [{ id: 'cola', quantity: 1 }], requestId: randomUUID() }),
+        body: JSON.stringify({ items: [{ id: 'cola', quantity: 1 }], guestName: 'Guest', requestId: randomUUID() }),
       });
       if (last.status === 429) break;
     }
@@ -215,7 +217,7 @@ test('retry of an accepted request id still works after rate limit', async () =>
     const post = (requestId) => fetch(`${s.base}/api/guest/${table.token}/orders`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Origin: s.base },
-      body: JSON.stringify({ items: [{ id: 'pizza', quantity: 1 }], requestId }),
+      body: JSON.stringify({ items: [{ id: 'pizza', quantity: 1 }], guestName: 'Guest', requestId }),
     });
     const firstId = randomUUID();
     const first = await post(firstId);

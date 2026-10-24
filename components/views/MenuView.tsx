@@ -3,6 +3,8 @@ import React from 'react';
 import { MenuItem, OrderItem, Language } from '../../types';
 import { getItemPrice, SPECIAL_MENU_CATEGORY } from '../../utils/helpers';
 import { translations } from '../../utils/translations';
+import { ServerOrder, canAddItems } from '../../utils/qr/adminOrders';
+import { formatBRL } from '../../utils/qr/helpers';
 import { Edit2, Trash, Star, Plus, Minus, Zap } from 'lucide-react';
 
 interface MenuViewProps {
@@ -17,12 +19,26 @@ interface MenuViewProps {
   onToggleFavorite: (id: number) => void;
   onMoveItem: (category: string, index: number, direction: 'up' | 'down') => void;
   language: Language;
+  /** Selected open server order (accepted/unpaid): adds go to it, not the local cart. */
+  serverTarget?: ServerOrder | null;
+  onAddToServerOrder?: (publishedItemId: string, quantity: number) => void;
 }
 
 const MenuView: React.FC<MenuViewProps> = ({
-  categories, menuItems, currentOrder, discounts, showLimitedMenu, onUpdateOrder, onEditItem, onDeleteItem, onToggleFavorite, onMoveItem, language
+  categories, menuItems, currentOrder, discounts, showLimitedMenu, onUpdateOrder, onEditItem, onDeleteItem, onToggleFavorite, onMoveItem, language, serverTarget, onAddToServerOrder
 }) => {
   const t = translations[language];
+  const serverMode = !!(serverTarget && canAddItems(serverTarget) && onAddToServerOrder);
+
+  const addItem = (item: MenuItem) => {
+    if (serverMode) {
+      // Explicit target: published menu item id; the SERVER resolves the price
+      // from its published snapshot — local prices are never trusted.
+      onAddToServerOrder!(String(item.id), 1);
+    } else if (!serverTarget) {
+      onUpdateOrder(item, 1);
+    }
+  };
 
   const renderItemCard = (item: MenuItem, index: number, cat: string, isFavSection: boolean = false, isSpecial: boolean = false) => {
     const currentPrice = getItemPrice(item, discounts);
@@ -101,7 +117,7 @@ const MenuView: React.FC<MenuViewProps> = ({
                 </div>
 
                 <div className="flex items-center justify-between gap-2 h-10">
-                    {inOrder ? (
+                    {!serverTarget && inOrder ? (
                         <div className="flex items-center bg-gray-100 rounded-lg p-1 w-full justify-between h-full border border-gray-200">
                             <button onClick={() => onUpdateOrder(item, -1)} className="w-8 h-full flex items-center justify-center bg-white rounded-md shadow-sm text-red-500 hover:bg-red-50 active:scale-95 transition-all border border-gray-100"><Minus size={16} /></button>
                             <input
@@ -121,10 +137,11 @@ const MenuView: React.FC<MenuViewProps> = ({
                         </div>
                     ) : (
                         <button
-                            onClick={() => onUpdateOrder(item, 1)}
-                            className={`w-full h-full text-white rounded-lg font-bold active:scale-95 transition-all shadow-lg flex items-center justify-center gap-2 ${isSpecial ? 'bg-purple-600 hover:bg-purple-700 shadow-purple-100' : 'bg-orange-600 hover:bg-orange-700 shadow-orange-100'}`}
+                            onClick={() => addItem(item)}
+                            disabled={!!serverTarget && !serverMode}
+                            className={`w-full h-full text-white rounded-lg font-bold active:scale-95 transition-all shadow-lg flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed ${serverMode ? 'bg-blue-600 hover:bg-blue-700 shadow-blue-100' : isSpecial ? 'bg-purple-600 hover:bg-purple-700 shadow-purple-100' : 'bg-orange-600 hover:bg-orange-700 shadow-orange-100'}`}
                         >
-                            <span>🛒</span> {t.add}
+                            <span>{serverMode ? '🎯' : '🛒'}</span> {serverTarget && !serverMode ? 'الطلب غير متاح للإضافة' : serverMode ? 'إضافة للطلب المحدد' : t.add}
                         </button>
                     )}
                 </div>
@@ -139,6 +156,16 @@ const MenuView: React.FC<MenuViewProps> = ({
 
   return (
     <div className="space-y-8 pb-20">
+
+      {/* Server order target banner: additions go to the selected order card */}
+      {serverTarget && (
+        <div className={`p-3 rounded-xl border text-sm font-bold ${serverMode ? 'bg-blue-50 border-blue-200 text-blue-800' : 'bg-gray-50 border-gray-200 text-gray-500'}`}>
+          {serverMode
+            ? <>🎯 الإضافة تذهب إلى طلب: {serverTarget.guestName}{serverTarget.tableLabel ? ` — ${serverTarget.tableLabel}` : ''} ({formatBRL(serverTarget.total)}). لإلغاء التوجيه، أغلق الطلب من تبويب الطلبات.</>
+            : <>الطلب المحدد غير قابل للإضافة (معلّق أو مدفوع).</>
+          }
+        </div>
+      )}
 
       {/* Special Limited Menu Section */}
       {showLimitedMenu && specialItems.length > 0 && (
