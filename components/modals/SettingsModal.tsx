@@ -136,6 +136,11 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ settings, onSave, onClose
             <h3 className="font-bold text-gray-700 mb-3 flex items-center gap-2">
                 📦 {t.backup}
             </h3>
+            <p className="text-xs text-amber-800 mb-3">
+              {lang === 'ar'
+                ? 'هذه الأزرار لبيانات المتصفح القديمة (localStorage) فقط. طلبات QR والكاشير محفوظة في SQLite وتحتاج نسخة خادم مستقلة؛ راجع README-QR.md.'
+                : 'These buttons only export/import legacy browser data (localStorage). QR and cashier orders live in SQLite and require a separate server backup; see README-QR.md.'}
+            </p>
             <div className="space-y-3">
               <button onClick={onExport} className="w-full bg-emerald-600 text-white px-4 py-3 rounded-xl flex items-center justify-center gap-2 font-bold hover:bg-emerald-700 transition-colors">
                 <Download size={20} />

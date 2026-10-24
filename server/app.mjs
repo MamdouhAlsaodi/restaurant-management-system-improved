@@ -216,6 +216,9 @@ export function createApp({
       notes: orderRow.notes ?? '',
       status: orderRow.status,
       createdAt: orderRow.created_at,
+      // Kitchen state exists only for accepted/paid orders; pending/rejected
+      // rows carry none.
+      ...(orderRow.prep_status ? { prepStatus: orderRow.prep_status } : {}),
       ...(orderRow.status === 'paid'
         ? { paidAt: orderRow.paid_at ?? null, paymentMethod: orderRow.payment_method ?? null }
         : {}),
@@ -224,7 +227,7 @@ export function createApp({
 
   // Guests never see financial/admin-only payment details.
   function guestOrderPayload(order) {
-    const { paidAt, paymentMethod, ...rest } = order;
+    const { paidAt, paymentMethod, prepStatus, ...rest } = order;
     return rest;
   }
 
@@ -618,7 +621,46 @@ export function createApp({
       if (row.status !== 'pending') {
         return errorJson(res, 409, `Order is already ${row.status}`);
       }
-      db.prepare('UPDATE orders SET status = ? WHERE id = ? AND status = ?').run(nextStatus, row.id, 'pending');
+      if (nextStatus === 'accepted') {
+        // Kitchen state starts at 'waiting' when an order enters the flow.
+        db.prepare("UPDATE orders SET status = 'accepted', prep_status = 'waiting' WHERE id = ? AND status = 'pending'").run(row.id);
+      } else {
+        db.prepare("UPDATE orders SET status = 'rejected' WHERE id = ? AND status = 'pending'").run(row.id);
+      }
+      return json(res, 200, { order: orderPayload(db.prepare('SELECT * FROM orders WHERE id = ?').get(row.id)) });
+    }
+
+    // Optional kitchen screen: persisted preparation state, strictly sequential
+    // waiting -> preparing -> ready -> served, independent of payment status.
+    m = /^\/api\/admin\/orders\/([0-9a-f-]{36})\/preparation$/.exec(pathname);
+    if (m && method === 'POST') {
+      const body = await readJson(req, res);
+      if (body === undefined) return;
+      const next = body.status;
+      if (next !== 'preparing' && next !== 'ready' && next !== 'served') {
+        return errorJson(res, 400, "status must be one of 'preparing', 'ready', 'served'");
+      }
+      const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(m[1]);
+      if (!row) return errorJson(res, 404, 'Not found');
+      if (row.status === 'pending' || row.status === 'rejected') {
+        return errorJson(res, 409, `Order is ${row.status}; kitchen applies only to accepted or paid orders`);
+      }
+      // Legacy accepted/paid rows migrated with a NULL prep_status behave as 'waiting'.
+      const current = row.prep_status ?? 'waiting';
+      if (current === next) {
+        return json(res, 200, { order: orderPayload(row) }); // idempotent same state
+      }
+      const NEXT = { waiting: 'preparing', preparing: 'ready', ready: 'served' };
+      if (NEXT[current] !== next) {
+        return errorJson(res, 409, `Kitchen state must advance sequentially; cannot go ${current} -> ${next}`);
+      }
+      // Atomic conditional update: a concurrent transition cannot be overwritten.
+      const info = withTransaction(() =>
+        db.prepare('UPDATE orders SET prep_status = ? WHERE id = ? AND prep_status IS ?').run(next, row.id, row.prep_status)
+      );
+      if (info.changes === 0) {
+        return errorJson(res, 409, 'Kitchen state changed concurrently; retry with fresh data');
+      }
       return json(res, 200, { order: orderPayload(db.prepare('SELECT * FROM orders WHERE id = ?').get(row.id)) });
     }
 

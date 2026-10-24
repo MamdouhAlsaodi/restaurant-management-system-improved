@@ -7,6 +7,11 @@ import {
   splitOrders,
 } from '../../utils/qr/adminOrders';
 import { formatBRL, describeOrderStatus, PublishedMenuItem } from '../../utils/qr/helpers';
+import {
+  buildReceiptData,
+  openReceiptPrintPopup,
+  RECEIPT_POPUP_BLOCKED_MESSAGE,
+} from '../../utils/qr/receipt';
 
 export interface InboxTable {
   id: number | string;
@@ -31,6 +36,14 @@ export interface OrderInboxProps {
   /** Adds a PUBLISHED menu item to the selected accepted order (server prices). */
   onAddItems: (orderId: string, publishedItemId: string, quantity: number) => Promise<boolean> | boolean;
   onCheckout: (order: ServerOrder) => void;
+  /** Whether opt-in QR arrival alerts are enabled this session (in-app only unless OS permission granted). */
+  alertsEnabled?: boolean;
+  /** Number of newly-arrived guest pending orders not yet acknowledged. */
+  newAlertCount?: number;
+  /** User-gesture toggle for arrival alerts — the only path that asks for OS permission. */
+  onToggleAlerts?: () => void;
+  /** Acknowledge the new-arrival badge. */
+  onDismissAlerts?: () => void;
 }
 
 const statusChipStyle = (status: string): React.CSSProperties => ({
@@ -69,11 +82,28 @@ const OrderInbox = ({
   onCreateManual,
   onAddItems,
   onCheckout,
+  alertsEnabled = false,
+  newAlertCount = 0,
+  onToggleAlerts,
+  onDismissAlerts,
 }: OrderInboxProps) => {
   const [manualName, setManualName] = useState('');
   const [manualTable, setManualTable] = useState<string>('');
   const [addItemId, setAddItemId] = useState<string>('');
   const [addItemQty, setAddItemQty] = useState<number>(1);
+  /** Popup-blocked / receipt errors are always shown, never silent. */
+  const [receiptError, setReceiptError] = useState<string>('');
+
+  const printReceipt = (order: ServerOrder) => {
+    try {
+      const data = buildReceiptData(order);
+      const popup = openReceiptPrintPopup(data);
+      if (!popup) setReceiptError(RECEIPT_POPUP_BLOCKED_MESSAGE);
+      else setReceiptError('');
+    } catch (err) {
+      setReceiptError(err instanceof Error ? err.message : RECEIPT_POPUP_BLOCKED_MESSAGE);
+    }
+  };
 
   const { pending, accepted, paid, rejected } = splitOrders(orders);
   const selected = orders.find((o) => o.id === selectedId) ?? null;
@@ -131,6 +161,18 @@ const OrderInbox = ({
               {order.items.length === 0 && <li style={{ listStyle: 'none', color: '#6b7280' }}>لا توجد أصناف بعد.</li>}
             </ul>
             {order.notes && <div style={{ color: '#6b7280', fontSize: 14 }}>ملاحظات: {order.notes}</div>}
+
+            {/* Receipt: PAID orders only — one receipt per order, no merging. */}
+            {order.status === 'paid' && (
+              <button
+                type="button"
+                aria-label={`طباعة / حفظ PDF إيصال الطلب ${order.id}`}
+                onClick={() => printReceipt(order)}
+                style={{ marginTop: 8, padding: '6px 14px', borderRadius: 8, border: '1px solid #2563eb', background: '#eff6ff', color: '#1d4ed8', fontWeight: 700, cursor: 'pointer' }}
+              >
+                🖨️ طباعة / حفظ PDF
+              </button>
+            )}
 
             {canApprove(order) && (
               <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
@@ -211,6 +253,44 @@ const OrderInbox = ({
 
   return (
     <div dir="rtl" style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+      {/* Opt-in QR arrival alerts: visible toggle + new-arrival badge (in-app). */}
+      <section
+        aria-label="تنبيهات وصول طلبات QR"
+        style={{ border: '1px solid #ddd', borderRadius: 12, padding: 12, display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center' }}
+      >
+        <button
+          type="button"
+          aria-label={alertsEnabled ? 'إيقاف تنبيهات وصول طلبات QR الجديدة' : 'تشغيل تنبيهات وصول طلبات QR الجديدة'}
+          aria-pressed={alertsEnabled}
+          onClick={() => onToggleAlerts?.()}
+          style={{
+            padding: '8px 14px',
+            borderRadius: 8,
+            border: '1px solid #cbd5e1',
+            background: alertsEnabled ? '#dcfce7' : '#f1f5f9',
+            color: '#0f172a',
+            fontWeight: 700,
+          }}
+        >
+          {alertsEnabled ? '🔔 التنبيهات مفعّلة' : '🔕 تشغيل تنبيهات الطلبات الجديدة'}
+        </button>
+        {newAlertCount > 0 && (
+          <span
+            role="status"
+            aria-label={`${newAlertCount} طلبات QR جديدة قيد الانتظار`}
+            style={{ background: '#fbbf24', color: '#78350f', borderRadius: 999, padding: '4px 12px', fontWeight: 800, fontSize: 13 }}
+          >
+            🆕 {newAlertCount} طلب QR جديد
+            <button
+              type="button"
+              aria-label="مسح عداد الطلبات الجديدة"
+              onClick={() => onDismissAlerts?.()}
+              style={{ marginRight: 8, border: 'none', background: 'transparent', fontWeight: 800, cursor: 'pointer' }}
+            >✕</button>
+          </span>
+        )}
+      </section>
+
       {/* Manual order creation */}
       <section style={{ border: '1px solid #ddd', borderRadius: 12, padding: 12 }}>
         <h3 style={{ marginTop: 0 }}>إنشاء طلب كاشير جديد</h3>
@@ -244,6 +324,9 @@ const OrderInbox = ({
 
       {loadError && <p style={{ color: '#b91c1c' }}>⚠️ خطأ في جلب الطلبات: {loadError}</p>}
       {actionError && <p style={{ color: '#b91c1c' }}>⚠️ {actionError}</p>}
+      {receiptError && (
+        <p role="alert" style={{ color: '#b91c1c', fontWeight: 700 }}>⚠️ {receiptError}</p>
+      )}
 
       {/* Open queue: pending + accepted cards */}
       <section>

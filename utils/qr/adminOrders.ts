@@ -31,12 +31,41 @@ export interface ServerOrder {
   notes: string;
   status: 'pending' | 'accepted' | 'rejected' | 'paid';
   createdAt: string;
+  /** Persisted kitchen preparation state (accepted/paid orders only). */
+  prepStatus?: PrepStatus;
   paidAt?: string;
   paymentMethod?: 'cash' | 'pix' | 'cartao' | 'ifood_card';
 }
 
 export const PAYMENT_METHODS = ['cash', 'pix', 'cartao', 'ifood_card'] as const;
 export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
+
+// ---- Optional kitchen screen: persisted preparation state ----
+// Strictly sequential: waiting -> preparing -> ready -> served.
+
+export const PREP_STATUSES = ['waiting', 'preparing', 'ready', 'served'] as const;
+export type PrepStatus = (typeof PREP_STATUSES)[number];
+
+const NEXT_PREP_STATUS: Record<PrepStatus, PrepStatus | null> = {
+  waiting: 'preparing',
+  preparing: 'ready',
+  ready: 'served',
+  served: null, // terminal
+};
+
+/** The only status a kitchen order may advance to; null when terminal/unknown. */
+export const nextPrepStatus = (status: PrepStatus | null | undefined): PrepStatus | null =>
+  status ? NEXT_PREP_STATUS[status] ?? null : null;
+
+/** Kitchen actions apply to accepted/paid orders that have not been served. */
+export const canSetPreparation = (order: { status: string; prepStatus?: PrepStatus | null }): boolean =>
+  (order.status === 'accepted' || order.status === 'paid') &&
+  !!order.prepStatus &&
+  order.prepStatus !== 'served';
+
+/** Orders shown on the kitchen screen: accepted/paid, not yet served. */
+export const kitchenOrders = (orders: ServerOrder[]): ServerOrder[] =>
+  orders.filter((o) => canSetPreparation(o));
 
 // ---- Stable request ids: ambiguous retries must never duplicate writes ----
 
@@ -142,6 +171,11 @@ export function mapServerOrder(raw: any): ServerOrder {
     notes: typeof raw.notes === 'string' ? raw.notes : '',
     status: raw.status === 'paid' || raw.status === 'accepted' || raw.status === 'rejected' ? raw.status : 'pending',
     createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : '',
+    ...((PREP_STATUSES as readonly string[]).includes(raw.prepStatus)
+      ? { prepStatus: raw.prepStatus as PrepStatus }
+      : raw.status === 'accepted' || raw.status === 'paid'
+        ? { prepStatus: 'waiting' as PrepStatus }
+        : {}),
     ...(typeof raw.paidAt === 'string' ? { paidAt: raw.paidAt } : {}),
     ...(typeof raw.paymentMethod === 'string' ? { paymentMethod: raw.paymentMethod as PaymentMethod } : {}),
   };
