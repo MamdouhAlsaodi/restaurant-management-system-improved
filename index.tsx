@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import './index.css';
 import App from './App';
+import StaffWorkspace from './components/qr/StaffWorkspace';
 import GuestPage from './components/qr/GuestPage';
 import AdminGate from './components/qr/AdminGate';
 
@@ -24,7 +25,7 @@ root.render(
       // / and /login (and any admin path): require an authenticated session
       // before mounting the original App and exposing localStorage data.
       <AdminGate>
-        <App />
+        {(actor) => actor.kind === 'owner' ? <App actor={actor} /> : <StaffWorkspace actor={actor} />}
       </AdminGate>
     )}
   </React.StrictMode>

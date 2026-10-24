@@ -12,7 +12,7 @@ test('login with correct password sets HttpOnly SameSite=Strict cookie', async (
     });
     assert.equal(res.status, 200);
     const body = await res.json();
-    assert.deepEqual(body, { authenticated: true });
+    assert.deepEqual(body, { authenticated: true, actor: { kind: 'owner', role: 'owner' } });
     const setCookie = res.headers.get('set-cookie') ?? '';
     assert.match(setCookie, /HttpOnly/i);
     assert.match(setCookie, /SameSite=Strict/i);
@@ -76,7 +76,7 @@ test('session endpoint reports authenticated with cookie; logout clears', async 
     let res = await fetch(`${s.base}/api/admin/session`, {
       headers: { Cookie: cookie },
     });
-    assert.deepEqual(await res.json(), { authenticated: true });
+    assert.deepEqual(await res.json(), { authenticated: true, actor: { kind: 'owner', role: 'owner' } });
 
     res = await fetch(`${s.base}/api/admin/logout`, {
       method: 'POST',

@@ -48,6 +48,29 @@ CREATE TABLE IF NOT EXISTS order_items (
   quantity INTEGER NOT NULL,
   source TEXT NOT NULL DEFAULT 'guest' CHECK (source IN ('guest','cashier'))
 );
+CREATE TABLE IF NOT EXISTS staff_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  salt TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('cashier','kitchen')),
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+-- Append-only audit trail: rows are only ever INSERTed, never updated or
+-- deleted. Metadata is bounded, sanitized JSON without secrets.
+CREATE TABLE IF NOT EXISTS audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,
+  action TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  actor_role TEXT NOT NULL,
+  actor_username TEXT,
+  order_id TEXT,
+  table_id INTEGER,
+  request_id TEXT,
+  metadata TEXT
+);
 `;
 
 // Non-destructive migration for databases created before multi-order support:

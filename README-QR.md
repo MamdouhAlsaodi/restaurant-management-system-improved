@@ -41,13 +41,32 @@ Environment variables:
 
 ## API surface
 
-Admin (session cookie; login via `POST /api/admin/login {password}` sets an
-HttpOnly, SameSite=Strict cookie; `GET /api/admin/session` reports auth state;
+Admin (session cookie; login via `POST /api/admin/login {password}` as the
+owner, or `{username, password}` as a staff member, sets an HttpOnly,
+SameSite=Strict cookie; `GET /api/admin/session` reports auth state plus the
+safe actor (`{kind:'owner',role:'owner'}` or `{kind:'staff',id,username,role}`);
 `POST /api/admin/logout` clears it):
 
-- `GET/POST /api/admin/tables`, `DELETE /api/admin/tables/:id` (revokes the token, including guest access)
-- `GET/PUT /api/admin/menu` — `PUT {items:[{id,name,price,image?,category?,description?}]}` **explicitly publishes a menu snapshot**; `price` is an integer amount in cents
+- `GET/POST /api/admin/tables`, `DELETE /api/admin/tables/:id` (revokes the token, including guest access) — writes are owner-only
+- `GET/PUT /api/admin/menu` — `PUT {items:[{id,name,price,image?,category?,description?}]}` **explicitly publishes a menu snapshot**; `price` is an integer amount in cents; writes are owner-only
 - `GET /api/admin/orders` (newest first), `POST /api/admin/orders/:id/accept`, `POST /api/admin/orders/:id/reject` (`pending → accepted|rejected` only; otherwise `409`)
+- `POST /api/admin/staff {username, password, role:'cashier'|'kitchen'}`, `GET /api/admin/staff`, `POST /api/admin/staff/:id/deactivate` — **owner only**; passwords are stored as salted scrypt hashes; deactivation revokes the staff member's live sessions
+- `GET /api/admin/audit?limit=&offset=` — **owner only**, newest first, bounded limit (max 200)
+
+### Staff roles (server-enforced)
+
+| Capability | Owner | Cashier | Kitchen |
+|---|---|---|---|
+| Read orders | ✓ | ✓ | Accepted/paid only, without payment details |
+| Read menu / tables | ✓ | ✓ | — |
+| Create order, add items, accept/reject, checkout | ✓ | ✓ | — |
+| Advance preparation (waiting→preparing→ready→served) | ✓ | — | ✓ |
+| Publish menu, manage tables, manage staff, view audit | ✓ | — | — |
+
+By default (no staff created) the installation is owner-only: the password
+login remains exactly as before and no default staff credentials exist.
+An owner-only **«الحسابات والتدقيق»** tab in the admin UI creates/deactivates
+staff and shows the latest 50 audit events.
 
 Cashier multi-order endpoints (admin session required):
 
@@ -102,7 +121,8 @@ process; static hosts cannot run it.
 ## Optional kitchen and per-order receipts
 
 The cashier queue remains the primary order screen. The kitchen section in
-Orders is collapsed by default; accepted or paid orders can advance through
+Orders is collapsed by default for the owner; the dedicated kitchen-staff view
+opens it by default. Accepted or paid orders can advance through
 waiting → preparing → ready → served independently of payment. You can ignore
 it if there is no kitchen station. A paid order has its own **Print / Save PDF**
 button in the cashier queue. This prints only that order's items and payment;
@@ -159,12 +179,63 @@ and stages a verified replacement before swapping. It cannot prove that a
 separate process will not start between the lock check and swap: keep the
 server **stopped for the entire restore**. No copy is deleted automatically.
 
+## Backups: two separate data stores
+
+The QR and cashier tables, menu, orders, and payments live in SQLite. Older POS
+sales, checkout, and settings live only in each admin browser's `localStorage`.
+**Neither backup includes the other store.** Export and import legacy browser
+records from Settings separately, using the same browser account; check the
+file before confirming replacement. SQLite backups contain customer data:
+keep them offline and encrypted, and never commit them to Git.
+
+### Consistent online SQLite backup
+
+```sh
+node scripts/restaurant-backup.mjs backup --db data/restaurant.sqlite --out /safe/offline/place/restaurant-backup.sqlite
+```
+
+The command uses SQLite's online backup API (including committed WAL data),
+refuses an existing destination, creates an owner-only file, and checks its
+integrity. Verify your `DB_PATH` setting and choose a new output filename for
+each backup; this does not automate backups.
+
+### Guarded offline restore
+
+Stop the restaurant server and rehearse on a disposable copy first. Then, for
+an **existing** target database, explicitly confirm:
+
+```sh
+node scripts/restaurant-backup.mjs restore --from /safe/offline/place/restaurant-backup.sqlite --to data/restaurant.sqlite --confirm-restore
+```
+
+The command checks source integrity, schema, and foreign keys before modifying
+the target; refuses symlinked source/target files, WAL/SHM sidecars, and locks;
+retains an owner-only `*.pre-restore.*.bak` rollback copy next to the original;
+and stages a verified replacement before swapping. It cannot prove that a
+separate process will not start between the lock check and swap: keep the
+server **stopped for the entire restore**. No copy is deleted automatically.
+
 ## Limitations (read before trusting this)
 
 - **Not production ready.** Single process, in-memory rate limiting and
   sessions (per-process), no clustering, no request queuing.
-- No CSRF tokens beyond SameSite=Strict cookies and Origin checking; no audit
-  log; no backup automation.
+- No CSRF tokens beyond SameSite=Strict cookies and Origin checking; no backup
+  automation.
+- The audit trail (`audit_log` table) is append-only by convention and API
+  surface; SQLite itself offers no tamper-proofing against someone with direct
+  DB write access. Audit entries are written in the same transaction as the
+  domain mutation where one exists, and replays (same `requestId` / idempotent
+  retries) never duplicate events. No passwords, cookies, tokens, guest names
+  or guest notes are ever written to it.
+- The staff UI is minimal: creation, deactivation and a recent-events list;
+  there is no pagination UI for audit, no password reset (deactivate + recreate
+  instead), and no per-staff activity report.
+- Staff sessions mount a server-only workspace; they do not render the legacy
+  POS screens or read browser-local sales in the UI. However, `localStorage` is
+  scoped to the **origin**, not the login: an employee with browser/devtools
+  access on the owner's device could still inspect it. Do not share a browser
+  profile holding owner-only legacy data with staff. Client-side hiding is not
+  a data-isolation boundary; the server enforces all SQLite API permissions.
 - Login rate limiting is per source IP in memory and resets on restart.
 - The admin UI is gated by the API, not by the static files — anyone can load
   the SPA shell, but admin data requires a valid session.

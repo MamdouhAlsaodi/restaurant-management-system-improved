@@ -1,8 +1,11 @@
 import { createServer } from 'node:http';
-import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
+import { promisify } from 'node:util';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { openDb } from './db.mjs';
+
+const scrypt = promisify(scryptCb);
 
 const MAX_BODY_BYTES = 64 * 1024;
 const NOTES_MAX = 500;
@@ -84,17 +87,33 @@ export function createApp({
 
   function pruneSessions() {
     const now = Date.now();
-    for (const [sid, exp] of sessions) if (exp < now) sessions.delete(sid);
+    for (const [sid, rec] of sessions) if (rec.exp < now) sessions.delete(sid);
   }
 
+  function revokeStaffSessions(staffId) {
+    for (const [sid, rec] of sessions) {
+      if (rec.actor?.kind === 'staff' && rec.actor.id === staffId) sessions.delete(sid);
+    }
+  }
+
+  // Returns the session actor ({kind:'owner'} or staff record) or false.
+  // Staff sessions are re-checked against the active flag so deactivation
+  // always wins, even if the in-memory revoke was missed (e.g. restart).
   function getSession(req) {
     const cookie = req.headers.cookie ?? '';
     const m = /(?:^|;\s*)sid=([A-Za-z0-9_-]+)/.exec(cookie);
     if (!m) return false;
     pruneSessions();
-    const exp = sessions.get(m[1]);
-    if (!exp || exp < Date.now()) return false;
-    return true;
+    const rec = sessions.get(m[1]);
+    if (!rec || rec.exp < Date.now()) return false;
+    if (rec.actor.kind === 'staff') {
+      const row = db.prepare('SELECT active FROM staff_users WHERE id = ?').get(rec.actor.id);
+      if (!row || !row.active) {
+        sessions.delete(m[1]);
+        return false;
+      }
+    }
+    return rec.actor;
   }
 
   function sameOrigin(req) {
@@ -230,6 +249,12 @@ export function createApp({
     const { paidAt, paymentMethod, prepStatus, ...rest } = order;
     return rest;
   }
+  function actorOrderPayload(row, actor) {
+    const payload = orderPayload(row);
+    if (actor.kind !== 'staff' || actor.role !== 'kitchen') return payload;
+    const { paidAt, paymentMethod, ...kitchenOnly } = payload;
+    return kitchenOnly;
+  }
 
   const PAYMENT_METHODS = new Set(['cash', 'pix', 'cartao', 'ifood_card']);
 
@@ -262,6 +287,66 @@ export function createApp({
   const insertMenuItem = db.prepare(
     'INSERT INTO menu_items (id, name, price_cents, image, category, description) VALUES (?, ?, ?, ?, ?, ?)'
   );
+
+  // ---- staff accounts (salted scrypt; raw passwords never stored/logged) ----
+
+  const STAFF_ROLES = new Set(['cashier', 'kitchen']);
+  const USERNAME_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+  const STAFF_PASSWORD_MIN = 8;
+
+  async function hashStaffPassword(password, salt) {
+    return (await scrypt(password, salt, 64)).toString('hex');
+  }
+
+  // Constant-ish work whether or not the username exists (no enumeration).
+  async function verifyStaffCredentials(username, password) {
+    const row = db.prepare('SELECT * FROM staff_users WHERE username = ?').get(username);
+    const salt = row?.salt ?? 'dummy-salt-for-timing';
+    const derived = await scrypt(password, salt, 64);
+    if (!row || !row.active) return null;
+    const stored = Buffer.from(row.password_hash, 'hex');
+    if (stored.length !== derived.length || !timingSafeEqual(stored, derived)) return null;
+    return { kind: 'staff', id: Number(row.id), username: row.username, role: row.role };
+  }
+
+  // ---- append-only audit trail ----
+
+  const insertAudit = db.prepare(
+    'INSERT INTO audit_log (at, action, actor_id, actor_role, actor_username, order_id, table_id, request_id, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  );
+  // Called inside the same transaction as the domain mutation wherever one
+  // exists. Metadata is constructed from safe fields only (never passwords,
+  // cookies, tokens, guest names or notes) and bounded in size.
+  function auditTx(actor, action, { orderId = null, tableId = null, requestId = null, metadata = null } = {}) {
+    const details = metadata === null ? null : JSON.stringify(metadata);
+    insertAudit.run(
+      new Date().toISOString(),
+      action,
+      actor.kind === 'owner' ? 'owner' : String(actor.id),
+      actor.kind === 'owner' ? 'owner' : actor.role,
+      actor.kind === 'owner' ? null : actor.username,
+      orderId,
+      tableId,
+      requestId,
+      details === null ? null : details.length <= 2000 ? details : JSON.stringify({ truncated: true })
+    );
+  }
+
+  function auditRow(r) {
+    return {
+      id: Number(r.id),
+      at: r.at,
+      action: r.action,
+      actorId: r.actor_id,
+      actorRole: r.actor_role,
+      ...(r.actor_username ? { actorUsername: r.actor_username } : {}),
+      ...(r.order_id ? { orderId: r.order_id } : {}),
+      ...(r.table_id !== null && r.table_id !== undefined ? { tableId: Number(r.table_id) } : {}),
+      ...(r.request_id ? { requestId: r.request_id } : {}),
+      ...(r.metadata ? { metadata: JSON.parse(r.metadata) } : {}),
+    };
+  }
+
   function withTransaction(fn) {
     db.exec('BEGIN');
     try {
@@ -274,10 +359,11 @@ export function createApp({
     }
   }
 
-  function publishTx(items) {
+  function publishTx(items, actor) {
     withTransaction(() => {
       db.prepare('DELETE FROM menu_items').run();
       for (const it of items) insertMenuItem.run(it.id, it.name, it.price, it.image ?? null, it.category ?? null, it.description ?? null);
+      auditTx(actor, 'menu.publish', { metadata: { count: items.length } });
     });
   }
 
@@ -300,7 +386,7 @@ export function createApp({
     return out;
   }
 
-  function insertOrderTx(order, items) {
+  function insertOrderTx(order, items, actor = null) {
     withTransaction(() => {
       db.prepare(
         'INSERT INTO orders (id, table_id, table_label, guest_name, source, notes, total_cents, status, created_at, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
@@ -321,6 +407,16 @@ export function createApp({
       );
       for (const it of items)
         ins.run(order.id, it.id, it.name, it.price, it.quantity, it.source ?? 'guest');
+      // Guest submissions are not audited: the audit trail covers staff/owner
+      // mutations. No guest names or notes are ever written to audit_log.
+      if (actor) {
+        auditTx(actor, 'order.create', {
+          orderId: order.id,
+          tableId: order.table_id,
+          requestId: order.request_id,
+          metadata: { source: order.source ?? 'guest', itemCount: items.length },
+        });
+      }
     });
   }
 
@@ -362,7 +458,8 @@ export function createApp({
 
     // Public admin endpoints
     if (pathname === '/api/admin/session' && method === 'GET') {
-      return json(res, 200, { authenticated: getSession(req) });
+      const actor = getSession(req);
+      return json(res, 200, actor ? { authenticated: true, actor } : { authenticated: false });
     }
 
     if (pathname === '/api/admin/login' && method === 'POST') {
@@ -373,22 +470,28 @@ export function createApp({
         res.setHeader('Retry-After', String(Math.ceil(LOGIN_WINDOW_MS / 1000)));
         return errorJson(res, 429, 'Too many failed attempts');
       }
-      const ok =
-        typeof body.password === 'string' &&
-        safeEqual(body.password, adminPassword);
-      if (!ok) {
+      // Backward compatible: password-only body logs in as the owner.
+      // Username + password logs in as a staff account. No default staff
+      // credentials ever exist; staff must be created by the owner.
+      let actor = null;
+      if (typeof body.password === 'string' && body.username === undefined) {
+        if (safeEqual(body.password, adminPassword)) actor = { kind: 'owner', role: 'owner' };
+      } else if (typeof body.username === 'string' && typeof body.password === 'string') {
+        actor = await verifyStaffCredentials(body.username, body.password);
+      }
+      if (!actor) {
         recordLoginFailure(ip);
         await new Promise((r) => setTimeout(r, LOGIN_FAILURE_DELAY_MS)); // fixed delay
         return errorJson(res, 401, 'Invalid credentials');
       }
       loginFailures.delete(ip);
       const sid = randomBytes(32).toString('base64url');
-      sessions.set(sid, Date.now() + SESSION_TTL_MS);
+      sessions.set(sid, { exp: Date.now() + SESSION_TTL_MS, actor });
       res.setHeader(
         'Set-Cookie',
         `sid=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL_MS / 1000}${secureCookies ? '; Secure' : ''}`
       );
-      return json(res, 200, { authenticated: true });
+      return json(res, 200, { authenticated: true, actor });
     }
 
     if (pathname === '/api/admin/logout' && method === 'POST') {
@@ -454,55 +557,145 @@ export function createApp({
       return json(res, 201, { order: guestOrderPayload(orderPayload(row)) });
     }
 
-    // Everything below: authenticated admin area
-    if (!getSession(req)) return errorJson(res, 401, 'Authentication required');
+    // Everything below: authenticated admin area. Sessions carry the actor
+    // (owner or staff with role); permissions are enforced server-side here.
+    const actor = getSession(req);
+    if (!actor) return errorJson(res, 401, 'Authentication required');
     if (method !== 'GET' && !sameOrigin(req)) return errorJson(res, 403, 'Forbidden');
+    const isOwner = actor.kind === 'owner';
+    const role = isOwner ? 'owner' : actor.role;
+    const canCashier = isOwner || role === 'cashier';
+
+    // Owner-only: staff management and audit viewing.
+    if (pathname === '/api/admin/staff' && method === 'POST') {
+      if (!isOwner) return errorJson(res, 403, 'Owner only');
+      const body = await readJson(req, res);
+      if (body === undefined) return;
+      if (typeof body.username !== 'string' || !USERNAME_RE.test(body.username.trim())) {
+        return errorJson(res, 400, 'username must be 1-64 chars of letters, digits, dot, dash or underscore');
+      }
+      if (typeof body.password !== 'string' || body.password.length < STAFF_PASSWORD_MIN || body.password.length > 200) {
+        return errorJson(res, 400, `password must be a string of at least ${STAFF_PASSWORD_MIN} characters`);
+      }
+      if (!STAFF_ROLES.has(body.role)) {
+        return errorJson(res, 400, "role must be 'cashier' or 'kitchen'");
+      }
+      const username = body.username.trim();
+      const exists = db.prepare('SELECT 1 FROM staff_users WHERE username = ?').get(username);
+      if (exists) return errorJson(res, 409, 'username already exists');
+      const salt = randomBytes(16).toString('hex');
+      const passwordHash = await hashStaffPassword(body.password, salt);
+      const info = withTransaction(() => {
+        const created = db
+          .prepare('INSERT INTO staff_users (username, password_hash, salt, role, active, created_at) VALUES (?, ?, ?, ?, 1, ?)')
+          .run(username, passwordHash, salt, body.role, new Date().toISOString());
+        auditTx(actor, 'staff.create', { metadata: { username, role: body.role } });
+        return created;
+      });
+      return json(res, 201, {
+        staff: { id: Number(info.lastInsertRowid), username, role: body.role, active: true },
+      });
+    }
+
+    m = /^\/api\/admin\/staff\/(\d+)\/deactivate$/.exec(pathname);
+    if (m && method === 'POST') {
+      if (!isOwner) return errorJson(res, 403, 'Owner only');
+      const id = Number(m[1]);
+      const row = db.prepare('SELECT * FROM staff_users WHERE id = ?').get(id);
+      if (!row) return errorJson(res, 404, 'Not found');
+      withTransaction(() => {
+        db.prepare('UPDATE staff_users SET active = 0 WHERE id = ?').run(id);
+        auditTx(actor, 'staff.deactivate', { metadata: { username: row.username } });
+      });
+      revokeStaffSessions(id);
+      return json(res, 200, {
+        staff: { id, username: row.username, role: row.role, active: false },
+      });
+    }
+
+    if (pathname === '/api/admin/staff' && method === 'GET') {
+      if (!isOwner) return errorJson(res, 403, 'Owner only');
+      const rows = db.prepare('SELECT id, username, role, active, created_at FROM staff_users ORDER BY id').all();
+      return json(res, 200, {
+        staff: rows.map((r) => ({ id: Number(r.id), username: r.username, role: r.role, active: !!r.active, createdAt: r.created_at })),
+      });
+    }
+
+    if (pathname === '/api/admin/audit' && method === 'GET') {
+      if (!isOwner) return errorJson(res, 403, 'Owner only');
+      const url = new URL(req.url ?? '/', 'http://localhost');
+      let limit = Number.parseInt(url.searchParams.get('limit') ?? '50', 10);
+      let offset = Number.parseInt(url.searchParams.get('offset') ?? '0', 10);
+      if (!Number.isFinite(limit) || limit < 1) limit = 50;
+      if (limit > 200) limit = 200;
+      if (!Number.isFinite(offset) || offset < 0) offset = 0;
+      const rows = db
+        .prepare('SELECT * FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?')
+        .all(limit, offset);
+      const total = db.prepare('SELECT COUNT(*) AS n FROM audit_log').get().n;
+      return json(res, 200, { events: rows.map(auditRow), total, limit, offset });
+    }
 
     if (pathname === '/api/admin/tables' && method === 'GET') {
+      if (!canCashier) return errorJson(res, 403, 'Forbidden for this role');
       const rows = db.prepare('SELECT * FROM restaurant_tables ORDER BY id').all();
       return json(res, 200, { tables: rows.map(tableRow) });
     }
 
     if (pathname === '/api/admin/tables' && method === 'POST') {
+      if (!isOwner) return errorJson(res, 403, 'Owner only');
       const body = await readJson(req, res);
       if (body === undefined) return;
       if (!isNonEmptyString(body.label, 100)) return errorJson(res, 400, 'label is required (1-100 chars)');
       const token = randomBytes(32).toString('base64url'); // >= 24 random bytes
-      const info = db
-        .prepare('INSERT INTO restaurant_tables (label, token, active) VALUES (?, ?, 1)')
-        .run(body.label.trim(), token);
+      const info = withTransaction(() => {
+        const created = db
+          .prepare('INSERT INTO restaurant_tables (label, token, active) VALUES (?, ?, 1)')
+          .run(body.label.trim(), token);
+        auditTx(actor, 'table.create', { tableId: Number(created.lastInsertRowid) });
+        return created;
+      });
       const row = db.prepare('SELECT * FROM restaurant_tables WHERE id = ?').get(info.lastInsertRowid);
       return json(res, 201, { table: tableRow(row) });
     }
 
     m = /^\/api\/admin\/tables\/(\d+)$/.exec(pathname);
     if (m && method === 'DELETE') {
+      if (!isOwner) return errorJson(res, 403, 'Owner only');
       const row = db.prepare('SELECT * FROM restaurant_tables WHERE id = ?').get(Number(m[1]));
       if (!row) return errorJson(res, 404, 'Not found');
-      db.prepare('UPDATE restaurant_tables SET active = 0 WHERE id = ?').run(row.id);
+      withTransaction(() => {
+        db.prepare('UPDATE restaurant_tables SET active = 0 WHERE id = ?').run(row.id);
+        auditTx(actor, 'table.deactivate', { tableId: Number(row.id) });
+      });
       const updated = db.prepare('SELECT * FROM restaurant_tables WHERE id = ?').get(row.id);
       return json(res, 200, { table: tableRow(updated) });
     }
 
     if (pathname === '/api/admin/menu' && method === 'GET') {
+      if (!canCashier) return errorJson(res, 403, 'Forbidden for this role');
       return json(res, 200, { items: menuItems() });
     }
 
     if (pathname === '/api/admin/menu' && method === 'PUT') {
+      if (!isOwner) return errorJson(res, 403, 'Owner only');
       const body = await readJson(req, res);
       if (body === undefined) return;
       const items = validateMenuItems(body.items);
       if (!items) return errorJson(res, 400, 'items must be valid menu items with integer cent prices');
-      publishTx(items);
+      publishTx(items, actor);
       return json(res, 200, { items: menuItems() });
     }
 
     if (pathname === '/api/admin/orders' && method === 'GET') {
-      const rows = db.prepare('SELECT * FROM orders ORDER BY created_at DESC, rowid DESC').all();
-      return json(res, 200, { orders: rows.map(orderPayload) });
+      const rows = actor.kind === 'staff' && actor.role === 'kitchen'
+        ? db.prepare("SELECT * FROM orders WHERE status IN ('accepted', 'paid') ORDER BY created_at DESC, rowid DESC").all()
+        : db.prepare('SELECT * FROM orders ORDER BY created_at DESC, rowid DESC').all();
+      return json(res, 200, { orders: rows.map((row) => actorOrderPayload(row, actor)) });
     }
 
     if (pathname === '/api/admin/orders' && method === 'POST') {
+      if (!canCashier) return errorJson(res, 403, 'Forbidden for this role');
       const body = await readJson(req, res);
       if (body === undefined) return;
       if (typeof body.requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.requestId)) {
@@ -537,13 +730,14 @@ export function createApp({
         created_at: new Date().toISOString(),
         request_id: body.requestId,
       };
-      insertOrderTx(order, []);
+      insertOrderTx(order, [], actor);
       const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(order.id);
       return json(res, 201, { order: orderPayload(row) });
     }
 
     m = /^\/api\/admin\/orders\/([0-9a-f-]{36})\/items$/.exec(pathname);
     if (m && method === 'POST') {
+      if (!canCashier) return errorJson(res, 403, 'Forbidden for this role');
       const body = await readJson(req, res);
       if (body === undefined) return;
       const v = validateItemsRequest(body);
@@ -578,6 +772,11 @@ export function createApp({
           body.requestId,
           row.id
         );
+        auditTx(actor, 'order.add_items', {
+          orderId: row.id,
+          requestId: body.requestId,
+          metadata: { items: v.wanted.map((w) => ({ id: w.id, quantity: w.quantity })), addedCents: added },
+        });
       });
       const updated = db.prepare('SELECT * FROM orders WHERE id = ?').get(row.id);
       return json(res, 200, { order: orderPayload(updated) });
@@ -585,6 +784,7 @@ export function createApp({
 
     m = /^\/api\/admin\/orders\/([0-9a-f-]{36})\/checkout$/.exec(pathname);
     if (m && method === 'POST') {
+      if (!canCashier) return errorJson(res, 403, 'Forbidden for this role');
       const body = await readJson(req, res);
       if (body === undefined) return;
       if (!PAYMENT_METHODS.has(body.paymentMethod)) {
@@ -604,29 +804,35 @@ export function createApp({
       }
       const itemCount = db.prepare('SELECT COUNT(*) AS n FROM order_items WHERE order_id = ?').get(row.id).n;
       if (itemCount === 0) return errorJson(res, 400, 'Cannot pay an empty order');
-      withTransaction(() => {
-        db.prepare(
+      const info = withTransaction(() => {
+        const updated = db.prepare(
           "UPDATE orders SET status = 'paid', paid_at = ?, payment_method = ? WHERE id = ? AND status = 'accepted'"
         ).run(new Date().toISOString(), body.paymentMethod, row.id);
+        if (updated.changes > 0) auditTx(actor, 'order.checkout', { orderId: row.id, metadata: { paymentMethod: body.paymentMethod } });
+        return updated;
       });
+      if (info.changes === 0) return errorJson(res, 409, 'Order changed concurrently; refresh and retry');
       const paid = db.prepare('SELECT * FROM orders WHERE id = ?').get(row.id);
       return json(res, 200, { order: orderPayload(paid) });
     }
 
     m = /^\/api\/admin\/orders\/([0-9a-f-]{36})\/(accept|reject)$/.exec(pathname);
     if (m && method === 'POST') {
+      if (!canCashier) return errorJson(res, 403, 'Forbidden for this role');
       const nextStatus = m[2] === 'accept' ? 'accepted' : 'rejected';
       const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(m[1]);
       if (!row) return errorJson(res, 404, 'Not found');
       if (row.status !== 'pending') {
         return errorJson(res, 409, `Order is already ${row.status}`);
       }
-      if (nextStatus === 'accepted') {
-        // Kitchen state starts at 'waiting' when an order enters the flow.
-        db.prepare("UPDATE orders SET status = 'accepted', prep_status = 'waiting' WHERE id = ? AND status = 'pending'").run(row.id);
-      } else {
-        db.prepare("UPDATE orders SET status = 'rejected' WHERE id = ? AND status = 'pending'").run(row.id);
-      }
+      const info = withTransaction(() => {
+        const updated = nextStatus === 'accepted'
+          ? db.prepare("UPDATE orders SET status = 'accepted', prep_status = 'waiting' WHERE id = ? AND status = 'pending'").run(row.id)
+          : db.prepare("UPDATE orders SET status = 'rejected' WHERE id = ? AND status = 'pending'").run(row.id);
+        if (updated.changes > 0) auditTx(actor, nextStatus === 'accepted' ? 'order.accept' : 'order.reject', { orderId: row.id });
+        return updated;
+      });
+      if (info.changes === 0) return errorJson(res, 409, 'Order changed concurrently; refresh and retry');
       return json(res, 200, { order: orderPayload(db.prepare('SELECT * FROM orders WHERE id = ?').get(row.id)) });
     }
 
@@ -634,6 +840,7 @@ export function createApp({
     // waiting -> preparing -> ready -> served, independent of payment status.
     m = /^\/api\/admin\/orders\/([0-9a-f-]{36})\/preparation$/.exec(pathname);
     if (m && method === 'POST') {
+      if (!(isOwner || role === 'kitchen')) return errorJson(res, 403, 'Forbidden for this role');
       const body = await readJson(req, res);
       if (body === undefined) return;
       const next = body.status;
@@ -648,20 +855,24 @@ export function createApp({
       // Legacy accepted/paid rows migrated with a NULL prep_status behave as 'waiting'.
       const current = row.prep_status ?? 'waiting';
       if (current === next) {
-        return json(res, 200, { order: orderPayload(row) }); // idempotent same state
+        return json(res, 200, { order: actorOrderPayload(row, actor) }); // idempotent same state
       }
       const NEXT = { waiting: 'preparing', preparing: 'ready', ready: 'served' };
       if (NEXT[current] !== next) {
         return errorJson(res, 409, `Kitchen state must advance sequentially; cannot go ${current} -> ${next}`);
       }
       // Atomic conditional update: a concurrent transition cannot be overwritten.
-      const info = withTransaction(() =>
-        db.prepare('UPDATE orders SET prep_status = ? WHERE id = ? AND prep_status IS ?').run(next, row.id, row.prep_status)
-      );
+      const info = withTransaction(() => {
+        const updated = db
+          .prepare('UPDATE orders SET prep_status = ? WHERE id = ? AND prep_status IS ?')
+          .run(next, row.id, row.prep_status);
+        if (updated.changes > 0) auditTx(actor, 'order.preparation', { orderId: row.id, metadata: { from: current, to: next } });
+        return updated;
+      });
       if (info.changes === 0) {
         return errorJson(res, 409, 'Kitchen state changed concurrently; retry with fresh data');
       }
-      return json(res, 200, { order: orderPayload(db.prepare('SELECT * FROM orders WHERE id = ?').get(row.id)) });
+      return json(res, 200, { order: actorOrderPayload(db.prepare('SELECT * FROM orders WHERE id = ?').get(row.id), actor) });
     }
 
     return errorJson(res, 404, 'Not found');
